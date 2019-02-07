@@ -301,6 +301,60 @@ class HConfigBase(object):
 
         return new_instance
 
+    def config_to_rollback_from(self, remediation, delta=None):
+        """
+        Build the rollback configuration based on the running config (self) and the
+        remediation config (remediation).
+        TODO
+        - copy tags from remediation to rollback
+        - explore ACLs
+        -
+        :param remediation:
+        :param delta:
+        :return:
+        """
+        from hier_config import HConfig
+        if delta is None:
+            delta = HConfig(host=self.host)
+
+        self._config_to_rollback_from_left(remediation, delta)
+        self._config_to_rollback_from_right(remediation, delta)
+
+
+        return delta
+
+    def _config_to_rollback_from_left(self, remediation, delta):
+        """
+        self is the running config
+        remediation is the remediation config
+        :param remediation:
+        :param delta: is the rollback configuration
+        :return:
+        """
+        for self_child in self.children:
+            if self_child in remediation:
+                continue
+
+    def _config_to_rollback_from_right(self, remediation, delta):
+        """
+        self is the running config
+        remediation is the remediation config
+        :param remediation:
+        :param delta: is the rollback configuration
+        :return:
+        """
+        for remediation_child in remediation.children:
+            if remediation_child in self:
+                continue
+            if remediation_child.text.startswith(('no ', 'default')):
+                text = " ".join(remediation_child.split()[1:])
+                running_config_child = self.get_child('equals', text)
+                if running_config_child:
+                    delta.add_deep_copy_of(running_config_child)
+                continue
+            # if line matches idempotent rule and in turn, a line in the running, copy it over
+
+
     def config_to_get_to(self, target, delta=None):
         """
         Figures out what commands need to be executed to transition from self to target.
