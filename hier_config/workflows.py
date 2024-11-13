@@ -1,4 +1,3 @@
-import ast
 from collections.abc import AsyncIterator, Iterable
 from logging import getLogger
 from typing import Optional
@@ -176,21 +175,13 @@ class WorkflowRemediation:
             msg = "No GPT client is initialized."
             raise GPTClientInitializationError(msg)
 
-        self._gpt_remediation_config = HConfig(self.running_config.driver)
-
         async for context in self._build_remediation_context():
             try:
                 prompt = self._build_gpt_prompt(context)
                 response = await self._gpt_client.generate_plan(prompt)
-
-                if isinstance(response, list) and all(
-                    isinstance(cmd, str) for cmd in response
-                ):
-                    commands = "\n".join(response)
-                else:
-                    commands = "\n".join(ast.literal_eval(response))
-
-                self._gpt_remediation_config.add_children_deep(commands)
+                command_text = "\n".join(response)
+                # This needs to change to an HConfig object
+                self._gpt_remediation_config = command_text
             except Exception as e:
                 msg = f"Failed to generate remediation plan: {e}"
                 raise RemediationError(msg) from e
@@ -209,8 +200,8 @@ class WorkflowRemediation:
             generated_config = self.generated_config.get_children_deep(rule.lineage)
 
             yield GPTRemediationContext(
-                running_config=str(running_config),
-                generated_config=str(generated_config),
+                running_config="\n".join([str(line) for line in running_config]),
+                generated_config="\n".join([str(line) for line in generated_config]),
                 description=rule.description,
                 example=rule.example
             )
@@ -219,39 +210,39 @@ class WorkflowRemediation:
     def _build_gpt_prompt(context: GPTRemediationContext) -> str:
         """Build GPT prompt from context."""
         return f"""
-        Generate a network configuration remediation plan as a Python list of commands to be executed sequentially for remediation.
+Generate a network configuration remediation plan as a Python list of commands to be executed sequentially for remediation.
 
-        Current Configuration:
-        {context.running_config}
+Current Configuration:
+{context.running_config}
 
-        Target Configuration:
-        {context.generated_config}
+Target Configuration:
+{context.generated_config}
 
-        Remediation Rules:
-        {context.description}
+Remediation Rules:
+{context.description}
 
-        Use the following Example as a guide for the format and structure of the commands:
+Use the following Example as a guide for the format and structure of the commands:
 
-        Example:
-        running config:
-        {context.example.running_config}
+Example:
+running config:
+{context.example.running_config}
 
-        remediation config:
-        {context.example.remediation_config}
+remediation config:
+{context.example.remediation_config}
 
-        Instructions:
-        - Generate a Python list of commands for the remediation plan.
-        - Follow the format and structure demonstrated in the Example context above.
-        - Maintain the command hierarchy, using indentation to denote child commands under parent commands.
-        - Each command should be a string in the list.
-        - Do not include rollback or validation steps. The list should only contain the commands required to implement the target configuration.
+Instructions:
+- Generate a Python list of commands for the remediation plan.
+- Follow the format and structure demonstrated in the Example context above.
+- Maintain the command hierarchy, using indentation to denote child commands under parent commands.
+- Each command should be a string in the list.
+- Do not include rollback or validation steps. The list should only contain the commands required to implement the target configuration.
 
-        Example output format:
-        [
-            "command1",
-            "parent_command",
-            "    child_command1",
-            "    child_command2",
-            "command2"
-        ]
-        """
+Example output format:
+[
+    "command1",
+    "parent_command",
+    "    child_command1",
+    "    child_command2",
+    "command2"
+]
+    """
