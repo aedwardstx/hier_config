@@ -107,7 +107,6 @@ disable = [
 
 
 [tool.pytest.ini_options]
-addopts = "--cov=hier_config --cov-report=term-missing"
 # Ignore certain warnings and turn all others into errors
 #filterwarnings = [
 #    "error",
