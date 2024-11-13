@@ -8,6 +8,7 @@ from hier_config.child import HConfigChild
 from hier_config.models import (
     BaseModel,
     FullTextSubRule,
+    GPTRemediationRule,
     IdempotentCommandsAvoidRule,
     IdempotentCommandsRule,
     IndentAdjustRule,
@@ -48,6 +49,7 @@ class HConfigDriverBase(ABC, BaseModel):  # pylint: disable=too-many-instance-at
     negation_default_when_rules: list[NegationDefaultWhenRule] = Field(default=[])
     negation_negate_with_rules: list[NegationDefaultWithRule] = Field(default=[])
     post_load_callbacks: list[Callable[[HConfig], None]] = Field(default=[])
+    gpt_remediation_rules: list[GPTRemediationRule] = Field(default=[])
 
     def idempotent_for(
         self,
