@@ -9,4 +9,7 @@ nav:
 - Install: install.md
 - Getting Started: getting-started.md
 - Advanced Topics: advanced-topics.md
-- Experimental Features: experimental-features.md
+- Future Config: future-config.md
+- GPT Based Remediation: gpt-based-remediation.md
+- JunOS Style Syntax Remediation: junos-style-sytax-remediation.md
+- Unified Diff: unified-diff.md
