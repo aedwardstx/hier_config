@@ -38,6 +38,17 @@ class ChatGPTClient(GPTClient):
         except json.JSONDecodeError:
             return []
 
+    def chat(self, prompt: str) -> str:
+        """Interact with ChatGPT textually."""
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=self.max_tokens,
+            temperature=self.temp,
+        )
+
+        return response.choices[0].message.content
+
     def generate_plan(self, prompt: str) -> list[str]:
         """Generate remediation plan from prompt using OpenAI's GPT chat model."""
         response = self.client.chat.completions.create(
