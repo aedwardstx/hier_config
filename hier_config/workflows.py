@@ -212,34 +212,45 @@ class WorkflowRemediation:
     def _build_gpt_prompt(context: GPTRemediationContext) -> str:
         """Build GPT prompt from context."""
         return f"""
-Generate a network configuration remediation plan as a Python list of commands to be executed sequentially for remediation.
+### Network Configuration Remediation Plan Generation
+**Objective**
+Generate a network configuration remediation plan as a Python list of commands to be executed *sequentially* for remediation.
 
-Current Configuration:
+**Current Configuration:**
+```
 {context.running_config}
+```
 
-Generated Configuration:
+**Desired Generated Configuration:**
+```
 {context.generated_config}
+```
 
-Remediation Rules:
+**Remediation Rules:**
 {context.description}
 
 Use the following example as a guide for the format and structure of the commands:
 
-Example:
-running config:
+**Example:**
+*running config:*
+```
 {context.example.running_config}
+```
 
-remediation config:
+*remediation config:*
+```
 {context.example.remediation_config}
+```
 
-Instructions:
-- Generate a Python list of commands for the remediation plan.
-- Follow the format and structure demonstrated in the Example context above.
-- Maintain the command hierarchy, using indentation to denote child commands under parent commands.
-- Each command should be a string in the list.
-- Do not include rollback or validation steps. The list should only contain the commands required to implement the generated configuration.
+**Instructions:**
+- **Generate a Python list** of commands for the remediation plan.
+- *Follow the format and structure** demonstrated in the Example context above.
+- **Maintain the command hierarchy** by using indentation to denote child commands under parent commands.
+- **Each command should be a string** in the list.
+- **Do not include** rollback or validation steps. The list should only contain the commands required to implement the generated configuration.
 
-Example output format:
+**Example output format:**
+```python
 [
     "command1",
     "parent_command",
@@ -247,4 +258,5 @@ Example output format:
     "    child_command2",
     "command2"
 ]
+```
     """

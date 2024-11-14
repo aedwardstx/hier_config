@@ -360,13 +360,22 @@ This initializes `WorkflowRemediation` with the configurations for a Cisco IOS p
 3. Define a GPT-Based Remediation Rule:
 ```python
 description = (
-        "When remediating an access-list on Cisco IOS devices:\n"
-        " 1. First, resequence the access-list.\n"
-        "    If a sequence number in the running config isn't divisible by 10,\n"
-        "    then resequence the sequence number to the nearest 10, starting at 10.\n"
-        " 2. Add a temporary 'permit any' statement at sequence 1.\n"
-        " 3. Apply the required changes to the access-list.\n"
-        " 4. Remove the temporary 'permit any' statement.\n"
+    "When remediating an access-list on Cisco IOS devices, follow these steps precisely:\n"
+    " 1. **Resequence the access-list:**\n"
+    "    * **Action**: Resequence the access-list so that each sequence number is a multiple of 10.\n"
+    "    * **Condition**: If a sequence number in the running config isn't divisible by 10, resequence it to the nearest 10, starting at 10.\n"
+    " 2. **Add Temporary Permit Statement:**\n"
+    "    * **Action**: Insert a temporary `'permit any'` statement at sequence number `1`.\n"
+    "    * **Purpose**: Ensures there's always a valid permit in place during modifications.\n"
+    " 3. **Apply Required Changes:**\n"
+    "    * **Action**: Update the access-list with the new permit statements as per the generated configuration.\n"
+    " 4. **Remove Temporary Permit Statement:**\n"
+    "    * **Action**: Remove the temporary `'permit any'` statement added at sequence number `1`.\n"
+    "\n"
+    " **Important**:\n"
+    " **When issuing `no` commands to remove existing entries after resequencing, USE THE"
+    " RESEQUENCED SEQUENCE NUMBERS, NOT THE ORIGINAL SEQUENCE NUMBERS FROM THE"
+    " RUNNING CONFIGURATION.**"
 )
 lineage = (MatchRule(startswith="ip access-list"),)
 running = "ip access-list extended TEST\n  12 permit ip host 10.0.0.1 any"

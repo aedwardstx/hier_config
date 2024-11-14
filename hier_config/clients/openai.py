@@ -7,12 +7,19 @@ from .models import GPTClient
 
 
 class ChatGPTClient(GPTClient):
-    def __init__(self, api_key: str, model: str = "gpt-4o-mini") -> None:
+    def __init__(
+        self,
+        api_key: str,
+        model: str = "gpt-4",
+        temp: int = 0,
+        max_tokens: int = 1000
+    ) -> None:
         """OpenAI GPT Client for generating remediation plans."""
         super().__init__()
-        self.api_key = api_key
+        self.client = OpenAI(api_key=api_key)
         self.model = model
-        self.client = OpenAI(api_key=self.api_key)
+        self.temp = temp
+        self.max_tokens = max_tokens
 
     @staticmethod
     def process_response(response: ChatCompletion) -> list[str]:
@@ -36,8 +43,8 @@ class ChatGPTClient(GPTClient):
         response = self.client.chat.completions.create(
             model=self.model,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=1000,
-            temperature=0.2,
+            max_tokens=self.max_tokens,
+            temperature=self.temp,
         )
 
         return self.process_response(response)
