@@ -1,8 +1,9 @@
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import Iterable, Iterator
 from logging import getLogger
 from typing import Optional
 
 from .clients import GPTClient
+from .constructors import load_from_string_lines
 from .exceptions import GPTClientInitializationError, RemediationError
 from .model import GPTRemediationContext, TagRule
 from .root import HConfig
@@ -164,7 +165,7 @@ class WorkflowRemediation:
         """Set GPT client for remediation planning."""
         self._gpt_client = gpt_client
 
-    async def gpt_remediation_config(self) -> HConfig:
+    def gpt_remediation_config(self) -> HConfig:
         """Generate GPT-based remediation plan.
 
         Returns:
@@ -175,20 +176,21 @@ class WorkflowRemediation:
             msg = "No GPT client is initialized."
             raise GPTClientInitializationError(msg)
 
-        async for context in self._build_remediation_context():
+        for context in self._build_remediation_context():
             try:
                 prompt = self._build_gpt_prompt(context)
-                response = await self._gpt_client.generate_plan(prompt)
+                response = self._gpt_client.generate_plan(prompt)
                 command_text = "\n".join(response)
                 # This needs to change to an HConfig object
-                self._gpt_remediation_config = command_text
+                self._gpt_remediation_config = HConfig(self.running_config.driver)
+                load_from_string_lines(self._gpt_remediation_config, command_text)
             except Exception as e:
                 msg = f"Failed to generate remediation plan: {e}"
                 raise RemediationError(msg) from e
 
-        return self._gpt_remediation_config
+        return self._gpt_remediation_config or HConfig(self.running_config.driver)
 
-    async def _build_remediation_context(self) -> AsyncIterator[GPTRemediationContext]:
+    def _build_remediation_context(self) -> Iterator[GPTRemediationContext]:
         """Generate context for GPT Prompt."""
         rules = self.running_config.driver.gpt_remediation_rules
 
@@ -203,7 +205,7 @@ class WorkflowRemediation:
                 running_config="\n".join([str(line) for line in running_config]),
                 generated_config="\n".join([str(line) for line in generated_config]),
                 description=rule.description,
-                example=rule.example
+                example=rule.example,
             )
 
     @staticmethod
@@ -215,13 +217,13 @@ Generate a network configuration remediation plan as a Python list of commands t
 Current Configuration:
 {context.running_config}
 
-Target Configuration:
+Generated Configuration:
 {context.generated_config}
 
 Remediation Rules:
 {context.description}
 
-Use the following Example as a guide for the format and structure of the commands:
+Use the following example as a guide for the format and structure of the commands:
 
 Example:
 running config:
@@ -235,7 +237,7 @@ Instructions:
 - Follow the format and structure demonstrated in the Example context above.
 - Maintain the command hierarchy, using indentation to denote child commands under parent commands.
 - Each command should be a string in the list.
-- Do not include rollback or validation steps. The list should only contain the commands required to implement the target configuration.
+- Do not include rollback or validation steps. The list should only contain the commands required to implement the generated configuration.
 
 Example output format:
 [

@@ -82,7 +82,7 @@ def get_hconfig(
     for rule in config.driver.full_text_sub_rules:
         config_raw = sub(rule.search, rule.replace, config_raw)
 
-    _load_from_string_lines(config, config_raw)
+    load_from_string_lines(config, config_raw)
 
     for child in tuple(config.all_children()):
         child.delete_sectional_exit()
@@ -210,8 +210,8 @@ def _config_from_string_lines_end_of_banner_test(
     return any(c in config_line for c in banner_end_contains)
 
 
-def _load_from_string_lines(config: HConfig, config_text: str) -> None:  # noqa: C901
-    if isinstance(config.driver, HConfigDriverJuniperJUNOS):
+def load_from_string_lines(config: HConfig, config_text: str) -> None:  # noqa: C901
+    if config.driver.platform == Platform.JUNIPER_JUNOS:
         config_text = _convert_to_set_commands(config_text)
 
     current_section: Union[HConfig, HConfigChild] = config

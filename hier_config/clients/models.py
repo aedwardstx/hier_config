@@ -5,5 +5,5 @@ class GPTClient(ABC):
     """Abstract base class for GPT client implementation."""
 
     @abstractmethod
-    async def generate_plan(self, prompt: str) -> str:
+    def generate_plan(self, prompt: str) -> list[str]:
         """Generate remediation plan from prompt."""
