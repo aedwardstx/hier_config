@@ -1,3 +1,4 @@
+use crate::NodeId;
 use crate::tree::Tree;
 
 pub use crate::platforms::functions::{MAX_RANGE_SPAN, MAX_RANGE_TOTAL, expand_range};
@@ -6,9 +7,17 @@ pub use crate::platforms::run_post_load_callbacks;
 
 /// Recursively removes trailing sectional exit lines matching the driver's exit command.
 pub fn delete_sectional_exit_recursive(tree: &mut Tree) {
-    let all_nodes = tree.all_children(tree.root);
-    for node_id in all_nodes {
+    // Only parents can end in an exit line, so leaves are never visited.
+    let has_children = |owner: &Tree, id: NodeId| !owner.arena[id].children.is_empty();
+    let mut parents: Vec<NodeId> = tree.arena[tree.root]
+        .children
+        .iter()
+        .filter(|&child| has_children(tree, child))
+        .collect();
+    while let Some(node_id) = parents.pop() {
         tree.delete_sectional_exit(node_id);
+        let children = tree.arena[node_id].children.iter();
+        parents.extend(children.filter(|&child| has_children(tree, child)));
     }
 }
 

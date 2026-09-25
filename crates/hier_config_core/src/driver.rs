@@ -202,6 +202,17 @@ impl DriverRules {
         }));
         Some(resolved)
     }
+
+    /// Reports whether any negation rules exist that use `Replace` strategy (negate-with).
+    #[inline]
+    #[must_use]
+    pub(crate) fn has_negate_with(&self) -> bool {
+        !self.negate_with.is_empty()
+            || self
+                .negation
+                .iter()
+                .any(|r| r.strategy == NegationStrategy::Replace)
+    }
 }
 
 fn validate_negate_with(rule: &NegationDefaultWithRule) -> Result<(), String> {

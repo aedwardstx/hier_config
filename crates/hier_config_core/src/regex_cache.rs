@@ -92,7 +92,7 @@ pub fn rule_regex(pattern: &str) -> Result<Arc<regex::Regex>, String> {
 #[derive(Clone, Debug)]
 pub enum MatchRegex {
     Linear(Arc<regex::Regex>),
-    Backtracking(Arc<fancy_regex::Regex>),
+    Backtracking(Arc<Backtracker>),
 }
 
 impl MatchRegex {
@@ -112,9 +112,7 @@ impl MatchRegex {
     pub fn is_match(&self, text: &str) -> Result<bool, String> {
         match self {
             Self::Linear(re) => Ok(re.is_match(text)),
-            Self::Backtracking(re) => re
-                .is_match(text)
-                .map_err(|error| format!("regex evaluation failed for {:?}: {error}", re.as_str())),
+            Self::Backtracking(re) => re.is_match(text),
         }
     }
 }
@@ -271,25 +269,161 @@ where
 /// match attempt, so a pathological pattern/input pair (catastrophic backtracking)
 /// fails the match with an error the callers already treat as "no match" instead of
 /// hanging the process.
-pub fn fancy(pattern: &str) -> Option<Arc<fancy_regex::Regex>> {
+pub fn fancy(pattern: &str) -> Option<Arc<Backtracker>> {
     /// Maximum backtracking steps per match. Config lines are short, so legitimate
     /// lookaround/backreference patterns stay far below this; catastrophic backtracking
     /// hits it and bails out.
     const BACKTRACK_LIMIT: usize = 100_000;
 
-    static CACHE: OnceLock<Cache<fancy_regex::Regex>> = OnceLock::new();
+    static CACHE: OnceLock<Cache<Backtracker>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| RwLock::new(HashMap::new()));
     lookup(cache, pattern, |p| {
-        fancy_regex::RegexBuilder::new(&translate_python_syntax(p))
+        let translated = translate_python_syntax(p);
+        let backtracking = fancy_regex::RegexBuilder::new(&translated)
             .backtrack_limit(BACKTRACK_LIMIT)
             .build()
-            .ok()
+            .ok()?;
+        Some(Backtracker {
+            regex: backtracking,
+            prefilter: linear_prefilter(&translated).and_then(|relaxed| regex(&relaxed)),
+        })
     })
+}
+
+/// A backtracking regex paired with a linear-time necessary condition.
+///
+/// Every line of a configuration is tested against rules such as XR's
+/// `^\s*template(?!...)`, and the backtracking VM costs far more per line than the
+/// linear engine. The prefilter rejects most lines before the VM runs.
+#[derive(Debug)]
+pub struct Backtracker {
+    regex: fancy_regex::Regex,
+    prefilter: Option<Arc<regex::Regex>>,
+}
+
+impl Backtracker {
+    /// # Errors
+    ///
+    /// Reports bounded-backtracking failures instead of treating them as nonmatches.
+    pub fn is_match(&self, text: &str) -> Result<bool, String> {
+        if let Some(prefilter) = &self.prefilter
+            && !prefilter.is_match(text)
+        {
+            return Ok(false);
+        }
+        self.regex.is_match(text).map_err(|error| {
+            format!(
+                "regex evaluation failed for {:?}: {error}",
+                self.regex.as_str()
+            )
+        })
+    }
+}
+
+/// Returns `pattern` with its zero-width lookarounds, word boundaries and atomic
+/// groupings relaxed away, or `None` when it needs backtracking for anything else.
+///
+/// Removing a constraint can only add matches, so the result is a necessary
+/// condition for `pattern`: text it rejects cannot match the original.
+fn linear_prefilter(pattern: &str) -> Option<String> {
+    use fancy_regex::{Assertion, Expr};
+
+    fn relax(expr: Expr) -> Option<Expr> {
+        Some(match expr {
+            Expr::LookAround(..)
+            | Expr::Assertion(
+                Assertion::LeftWordBoundary
+                | Assertion::RightWordBoundary
+                | Assertion::WordBoundary
+                | Assertion::NotWordBoundary,
+            ) => Expr::Empty,
+            Expr::AtomicGroup(child) => Expr::Concat(vec![relax(*child)?]),
+            Expr::Group(child) => Expr::Group(Box::new(relax(*child)?)),
+            Expr::Concat(children) => {
+                Expr::Concat(children.into_iter().map(relax).collect::<Option<_>>()?)
+            }
+            Expr::Alt(children) => {
+                Expr::Alt(children.into_iter().map(relax).collect::<Option<_>>()?)
+            }
+            Expr::Repeat {
+                child,
+                lo,
+                hi,
+                greedy,
+            } => Expr::Repeat {
+                child: Box::new(relax(*child)?),
+                lo,
+                hi,
+                greedy,
+            },
+            expr @ (Expr::Empty
+            | Expr::Any { .. }
+            | Expr::Literal { .. }
+            | Expr::Delegate { .. }
+            | Expr::Assertion(_)) => expr,
+            _ => return None,
+        })
+    }
+
+    let relaxed = relax(Expr::parse_tree(pattern).ok()?.expr)?;
+    let mut out = String::new();
+    relaxed.to_str(&mut out, 0);
+    Some(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lookaround_prefilter_relaxes_zero_width_constraints() {
+        let relaxed = linear_prefilter(r"^\s*template(?!\s+timeout)").expect("relaxable");
+        let prefilter = regex(&relaxed).expect("linear pattern");
+        assert!(prefilter.is_match("template foo"));
+        assert!(prefilter.is_match("template timeout 5"));
+        assert!(!prefilter.is_match("interface Gi0"));
+
+        assert!(linear_prefilter(r"(?<=a)b\bc(?>d|de)").is_some());
+        assert!(linear_prefilter(r"(a)\1").is_none());
+
+        let xr_indent = fancy(r"^\s*template(?!\s+(?:data\s+|options\s+)?timeout)");
+        assert!(xr_indent.expect("valid pattern").prefilter.is_some());
+    }
+
+    #[test]
+    fn prefiltered_backtracking_matches_agree_with_fancy_regex() {
+        let patterns = [
+            r"^\s*template(?!\s+(?:data\s+|options\s+)?timeout)",
+            r"(?i)^INTERFACE(?=\s)",
+            r"(?<=vlan )\d+\b",
+            r"^(\w+) \1$",
+            r"^(?>a|ab)c",
+        ];
+        let lines = [
+            "",
+            "template foo",
+            " template data timeout 5",
+            "interface Gi0",
+            "Interface\tGi0",
+            "vlan 10",
+            "vlan 10x",
+            "abc abc",
+            "abc",
+            "ac",
+        ];
+        for pattern in patterns {
+            let native = MatchRegex::cached(pattern).expect("valid pattern");
+            assert!(matches!(native, MatchRegex::Backtracking(_)), "{pattern}");
+            let reference = fancy_regex::Regex::new(pattern).expect("valid pattern");
+            for line in lines {
+                assert_eq!(
+                    native.is_match(line).unwrap(),
+                    reference.is_match(line).unwrap(),
+                    "{pattern:?} on {line:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn compiles_and_reuses_the_same_instance() {

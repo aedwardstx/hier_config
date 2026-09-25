@@ -5,7 +5,7 @@ The Rust rewrite retains the main tree/driver/workflow API but includes explicit
 the profiled release build, not a proof that every future optimization requires
 an API break. Some measured hot paths are dominated by CPython object construction.
 
-This document records what is *left* to do. It lists the two remaining optimisations, what each would cost to unlock, and the measurements that justify them. Work that has already shipped is not tracked here — see `CHANGELOG.md` for history, [Performance & Benchmarks](benchmarks.md) for the 3.x to 4.0 benchmark story, [Architecture](architecture.md#core-tree-model) for the data-layout decisions and invariants that came out of it, and the [3.x → 4.0 migration guide](../user/rust-core-changes.md) for consumer-facing consequences.
+This document records what is *left* to do. It lists the remaining optimisations, what each would cost to unlock, and the measurements that justify them. Work that has already shipped is not tracked here — see `CHANGELOG.md` for history, [Performance & Benchmarks](benchmarks.md) for the 3.x to 4.0 benchmark story, [Architecture](architecture.md#core-tree-model) for the data-layout decisions and invariants that came out of it, and the [3.x → 4.0 migration guide](../user/rust-core-changes.md) for consumer-facing consequences.
 
 ---
 
@@ -19,12 +19,12 @@ Reference figures on an Apple M2 Max, release build (`maturin develop --release`
 | `iteration` | 0.037 | 0.11 ms | 0.06 | ~0.011 units, via [item 2](#2-expose-a-bulkcolumnar-accessor) |
 | `remediation` | 0.123 | 0.37 ms | 0.19 | None — Rust-bound |
 | `fast_load` | 0.162 | 0.48 ms | 0.24 | None — Rust-bound |
-| `parse` | 0.184 | 0.55 ms | 0.27 | None — Rust-bound |
+| `parse` | 0.184 | 0.55 ms | 0.27 | Rust-bound; see [items 3](#3-store-node-text-without-a-per-node-allocation) and [4](#4-simd-byte-scans-in-the-parser) |
 | `dump` | 0.266 | 0.80 ms | 0.37 | ~45%, via [item 1](#1-change-dumpline-from-a-pydantic-model-to-a-__slots__-class) |
 
 Re-derive these with `pytest -m benchmark tests/benchmarks/test_perf_regression.py -v -s` rather than trusting any number written down here.
 
-**Only two operations have headroom left, and both are gated on the object model.** `parse`, `fast_load`, `deepcopy`, and `remediation` are Rust-bound and their compatible headroom has been collected; the split below is why.
+**Two operations have headroom that is gated on the object model** (items 1 and 2). `fast_load`, `deepcopy`, and `remediation` are Rust-bound and their compatible headroom has been collected; the split below is why. `parse` is Rust-bound too, but profiling large configurations shows it still has core-side headroom (items 3 and 4).
 
 ### Why the rest is finished
 
@@ -109,10 +109,59 @@ What is left is the `Py::new` per node itself. That is only avoidable by not con
 
 ---
 
+## 3. Store node text without a per-node allocation
+
+**Gain:** the largest remaining lever on `parse`. On the 50k-line IOS benchmark, building and freeing the tree is over 60% of the ~5.0 ms Rust core time.
+**Cost:** internal only — no public API change. A sizeable refactor of `crates/hier_config_core/src/tree/`.
+**Status:** not taken; unmeasured beyond the profile below.
+
+Every parsed line becomes a node that owns an `Arc<str>` for its text, plus a children `Vec` and a text index once it has children. For the 48,431-line benchmark (42,423 nodes), a release-build profile of the Rust core splits roughly as:
+
+| Phase | Time |
+|---|---:|
+| Inserting children (index lookup, allocation, `Vec` growth) | ~2.4 ms |
+| Freeing the tree | ~0.78 ms |
+| Per-line regex substitutions | ~0.8 ms |
+| Line splitting, whitespace normalisation, trims | ~1.1 ms |
+
+Storing all line text in one shared buffer (or an arena of string slices) and referencing it by offset would replace tens of thousands of small allocations and frees with a handful of large ones. The hard parts are that the children index keys on `Arc<str>` shared with the node, and that nodes are edited, copied and cloned after parsing, so mutation and `deepcopy` must keep working without the buffer growing unboundedly.
+
+**Measure first:** prototype text storage alone in a native harness, and compare both parse and drop time before touching the index.
+
+---
+
+## 4. SIMD byte scans in the parser
+
+**Gain:** small — an estimated 0.3–0.4 ms (~7%) of the 50k-line parse. Nothing outside the parser benefits.
+**Cost:** a new Rust dependency, which needs discussion in an issue first.
+**Status:** not taken. The scans already process eight bytes at a time in plain Rust (SWAR).
+
+Only two parser passes scan long runs of bytes in a way that suits vector lanes:
+
+| Pass | Current time (50k lines) | Estimated saving |
+|---|---:|---:|
+| `splitlines` (`find_line_boundary`) | ~0.5 ms | ~0.25 ms |
+| Whitespace-normalisation check (`is_already_normalized`) | ~0.3 ms | ~0.15 ms |
+
+Widening them from 8 bytes to 16–32 bytes per step is the whole opportunity. Indentation measurement and trims touch only a few bytes per line and would not benefit.
+
+`hier_config_core` declares `#![forbid(unsafe_code)]`, which narrows the choice of library:
+
+- **`fearless_simd`** fits best: a 1.0 release, no dependencies in the core crate, a safe API, and runtime selection of the best SIMD level. It keeps `forbid(unsafe_code)` intact.
+- **`pulp`** and **`rten-simd`** are comparable alternatives with runtime detection.
+- **`wide`** needs CPU features chosen at compile time, which is workable only for the baseline SSE2/NEON level.
+- **`std::arch`** needs `unsafe` for vector loads and a separate path per architecture.
+- **`std::simd`** requires a nightly compiler unless it has since been stabilised; the project builds on stable Rust.
+
+Item 3 is worth several times more and should be done first. If this item is attempted, prototype both scans on a throwaway branch and confirm the saving before opening the dependency discussion.
+
+---
+
 ## What is not worth attempting
 
 - **More Rust-side work on `dump`.** It is at ~246 ns/line against a ~250 ns CPython floor. Item 1 or nothing.
-- **More work on `remediation`, `parse`, `fast_load`, or `deepcopy`.** All Rust-bound with the compatible headroom already collected. Confirm against a native harness before assuming otherwise.
+- **More work on `remediation`, `fast_load`, or `deepcopy`.** All Rust-bound with the compatible headroom already collected. Confirm against a native harness before assuming otherwise.
+- **SIMD outside the parser's byte scans.** Remediation, `future()` and rollback are hash lookups over the tree, `dump` and iteration are bound by CPython object construction, and the regular expressions already use SIMD inside the `regex` crate. None of these have work shaped for vector lanes.
 - **Dropping node interning wholesale** rather than the current conservative split. The extra gain over keeping single-node identity is small, and it breaks the one identity case the suite pins. See [Architecture](architecture.md#core-tree-model).
 - **Removing `Dump` / `DumpLine` from the public surface.** Serialising a config is a legitimate documented use case; changing the class shape is justified, deleting the API is not.
 
@@ -130,6 +179,6 @@ What is left is the `Py::new` per node itself. That is only avoidable by not con
 
 ## Realistic ceiling
 
-Taking both items would land `iteration` at ~0.026 units and `dump` at ~0.15. Nothing else moves.
+Taking items 1 and 2 would land `iteration` at ~0.026 units and `dump` at ~0.15. Items 3 and 4 only move `parse`: together they are unlikely to take more than 1–1.5 ms off the 50k-line benchmark's ~5.0 ms core time.
 
-A blanket "2x across the board" is **not** achievable while the current API holds — that is a measured result, not a prediction. The work already done cleared 1.35–1.86x on the Rust-bound operations and 2.6x on `iteration`, and moved `dump` almost not at all. The remaining gains are concentrated in exactly two operations, and both are paid for in compatibility or in new API surface.
+A blanket "2x across the board" is **not** achievable while the current API holds — that is a measured result, not a prediction. The work already done cleared 1.35–1.86x on the Rust-bound operations and 2.6x on `iteration`, and moved `dump` almost not at all. The large remaining gains are concentrated in exactly two operations, and both are paid for in compatibility or in new API surface; `parse` has smaller, internal-only headroom.

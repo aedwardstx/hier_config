@@ -271,22 +271,48 @@ impl Tree {
 
     /// Yields configuration texts along the lineage from top-level child down to `node_id`.
     pub fn path(&self, node_id: NodeId) -> Vec<String> {
-        self.lineage(node_id)
-            .into_iter()
-            .filter_map(|id| self.arena.get(id).map(|n| n.text.to_string()))
-            .collect()
+        let mut refs = Vec::new();
+        self.path_refs(node_id, &mut refs);
+        refs.into_iter().map(str::to_owned).collect()
+    }
+
+    /// Replaces the buffer with text slices from the top-level child down to `node_id`.
+    fn path_refs<'a>(&'a self, node_id: NodeId, buf: &mut Vec<&'a str>) {
+        buf.clear();
+        let mut curr = Some(node_id);
+        while let Some(node) = curr
+            .filter(|&id| id != self.root)
+            .and_then(|id| self.arena.get(id))
+        {
+            buf.push(&node.text);
+            curr = node.parent;
+        }
+        buf.reverse();
     }
 
     /// Checks if a node's lineage matches a sequence of match rules.
+    ///
+    /// Walks the parent chain against the rules in reverse rather than materializing
+    /// [`Self::lineage`]; this runs for every rule of every node during remediation.
     pub fn is_lineage_match(&self, node_id: NodeId, rules: &[MatchRule]) -> bool {
-        let lin = self.lineage(node_id);
-        if lin.len() != rules.len() {
-            return false;
+        if node_id == self.root || !self.arena.contains(node_id) {
+            return rules.is_empty();
         }
-        lin.iter()
-            .rev()
-            .zip(rules.iter().rev())
-            .all(|(&id, rule)| self.arena.get(id).is_some_and(|n| rule.is_match(&n.text)))
+
+        let mut curr = Some(node_id);
+        for rule in rules.iter().rev() {
+            let Some(id) = curr.filter(|&id| id != self.root) else {
+                return false;
+            };
+            let Some(node) = self.arena.get(id) else {
+                return false;
+            };
+            if !rule.is_match(&node.text) {
+                return false;
+            }
+            curr = node.parent;
+        }
+        curr.is_none_or(|id| id == self.root)
     }
 
     /// Checks if duplicate children are allowed under `parent_id`.
@@ -315,6 +341,46 @@ impl Tree {
         check_if_present: bool,
         return_if_present: bool,
     ) -> Result<NodeId, TreeError> {
+        let trimmed = self.validated_child_text(parent_id, text)?;
+        let shared: Arc<str> = Arc::from(trimmed);
+
+        if !check_if_present {
+            let child_id = self.insert_child_node(parent_id, &shared);
+            self.arena[parent_id]
+                .children
+                .append(&shared, child_id, true);
+            return Ok(child_id);
+        }
+
+        let predicted = self.arena.next_id();
+        let Some(existing_id) = self.arena[parent_id].children.claim(&shared, predicted) else {
+            let child_id = self.insert_child_node(parent_id, &shared);
+            debug_assert_eq!(child_id, predicted);
+            self.arena[parent_id].children.push_claimed(child_id);
+            return Ok(child_id);
+        };
+
+        if self.is_duplicate_child_allowed(parent_id) {
+            let child_id = self.insert_child_node(parent_id, &shared);
+            self.arena[parent_id]
+                .children
+                .append(&shared, child_id, false);
+            return Ok(child_id);
+        }
+        if return_if_present {
+            return Ok(existing_id);
+        }
+        let mut path = self.path(parent_id);
+        path.push(trimmed.to_string());
+        Err(TreeError::DuplicateChild(path))
+    }
+
+    /// Trims `text` and checks that it can become a child of `parent_id`.
+    fn validated_child_text<'t>(
+        &self,
+        parent_id: NodeId,
+        text: &'t str,
+    ) -> Result<&'t str, TreeError> {
         let trimmed = text.trim();
         if trimmed.is_empty() {
             return Err(TreeError::EmptyText);
@@ -324,42 +390,46 @@ impl Tree {
             return Err(TreeError::InvalidParent(parent_id));
         }
 
-        // Central depth guard: every node in the tree is created here, so bounding
-        // depth once keeps the recursive traversals (XML, remediation, dumping)
-        // from overflowing the stack. See `MAX_TREE_DEPTH`.
+        // Central depth guard: every node in the tree is created through here, so
+        // bounding depth once keeps the recursive traversals (XML, remediation,
+        // dumping) from overflowing the stack. See `MAX_TREE_DEPTH`.
         if self.depth_at_least(parent_id, MAX_TREE_DEPTH) {
             return Err(TreeError::MaxDepthExceeded(MAX_TREE_DEPTH));
         }
+        Ok(trimmed)
+    }
 
-        if check_if_present && let Some(existing_id) = self.arena[parent_id].children.get(trimmed) {
-            if self.is_duplicate_child_allowed(parent_id) {
-                let shared: Arc<str> = Arc::from(trimmed);
-                let mut node = Node::from_shared_text(Arc::clone(&shared), Some(parent_id));
-                let parent_real_indent = self.arena[parent_id].real_indent_level;
-                node.real_indent_level = parent_real_indent + 1;
-                let child_id = self.arena.insert(node);
-                self.arena[parent_id]
-                    .children
-                    .append(&shared, child_id, false);
-                return Ok(child_id);
-            }
-            if return_if_present {
-                return Ok(existing_id);
-            }
-            let mut path = self.path(parent_id);
-            path.push(trimmed.to_string());
-            return Err(TreeError::DuplicateChild(path));
-        }
+    /// Inserts a node whose parent is `parent_id` without linking it into the
+    /// parent's children.
+    fn insert_child_node(&mut self, parent_id: NodeId, text: &Arc<str>) -> NodeId {
+        let mut node = Node::from_shared_text(Arc::clone(text), Some(parent_id));
+        node.real_indent_level = self.arena[parent_id].real_indent_level + 1;
+        self.arena.insert(node)
+    }
 
-        let shared: Arc<str> = Arc::from(trimmed);
-        let mut node = Node::from_shared_text(Arc::clone(&shared), Some(parent_id));
-        let parent_real_indent = self.arena[parent_id].real_indent_level;
-        node.real_indent_level = parent_real_indent + 1;
-        let child_id = self.arena.insert(node);
-        self.arena[parent_id]
-            .children
-            .append(&shared, child_id, true);
-        Ok(child_id)
+    /// Creates a child of `parent_id`, validated like [`Self::add_child`], that is not
+    /// yet one of the parent's children.
+    ///
+    /// Pass it to [`Self::attach_child`] to append it, or to
+    /// [`Self::discard_detached`] to drop it without touching the parent.
+    pub(crate) fn new_detached_child(
+        &mut self,
+        parent_id: NodeId,
+        text: &str,
+    ) -> Result<NodeId, TreeError> {
+        let trimmed = self.validated_child_text(parent_id, text)?;
+        Ok(self.insert_child_node(parent_id, &Arc::from(trimmed)))
+    }
+
+    /// Appends a child created by [`Self::new_detached_child`] to `parent_id`.
+    pub(crate) fn attach_child(&mut self, parent_id: NodeId, child_id: NodeId) {
+        let text = Arc::clone(&self.arena[child_id].text);
+        self.arena[parent_id].children.append(&text, child_id, true);
+    }
+
+    /// Removes a child created by [`Self::new_detached_child`] and its subtree.
+    pub(crate) fn discard_detached(&mut self, child_id: NodeId) {
+        self.delete_subtree(child_id);
     }
 
     /// Adds multiple children directly under `parent_id`.
@@ -1277,8 +1347,6 @@ impl Tree {
         other_tree: &Self,
         other_children: &[NodeId],
     ) -> Option<NodeId> {
-        let self_path = self.path(node_id);
-        let self_path_refs: Vec<&str> = self_path.iter().map(String::as_str).collect();
         let (rules, driver) = if self.driver.rules.idempotent_commands.is_empty() {
             (
                 &other_tree.driver.rules.idempotent_commands,
@@ -1287,6 +1355,14 @@ impl Tree {
         } else {
             (&self.driver.rules.idempotent_commands, &self.driver)
         };
+        if rules.is_empty() {
+            return None;
+        }
+
+        let mut self_path_refs = Vec::new();
+        self.path_refs(node_id, &mut self_path_refs);
+        let mut other_path_refs = Vec::new();
+
         for rule in rules {
             if !self.is_lineage_match(node_id, &rule.match_rules) {
                 continue;
@@ -1298,8 +1374,7 @@ impl Tree {
                 if !other_tree.is_lineage_match(other_id, &rule.match_rules) {
                     continue;
                 }
-                let other_path = other_tree.path(other_id);
-                let other_path_refs: Vec<&str> = other_path.iter().map(String::as_str).collect();
+                other_tree.path_refs(other_id, &mut other_path_refs);
                 let other_key = driver.idempotency_key(&other_path_refs, &rule.match_rules);
 
                 if !self_key.is_empty() && self_key == other_key {
@@ -1821,6 +1896,42 @@ impl Iterator for DescendantsSorted<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detached_child_is_invisible_until_attached() {
+        let mut tree = Tree::for_platform(Platform::Generic);
+        let parent = tree
+            .add_child(tree.root, "interface Gi1", true, false)
+            .unwrap();
+        tree.add_child(parent, "description a", true, false)
+            .unwrap();
+
+        let detached = tree.new_detached_child(parent, "  shutdown ").unwrap();
+        tree.add_child(detached, "nested", true, false).unwrap();
+        assert_eq!(tree.arena[parent].children.len(), 1);
+        assert!(!tree.arena[parent].children.contains("shutdown"));
+        assert_eq!(tree.path(detached), ["interface Gi1", "shutdown"]);
+        assert_eq!(
+            tree.arena[detached].real_indent_level,
+            tree.arena[parent].real_indent_level + 1
+        );
+
+        tree.attach_child(parent, detached);
+        assert_eq!(tree.arena[parent].children.get("shutdown"), Some(detached));
+        assert_eq!(tree.dump_simple(false).len(), 4);
+
+        let discarded = tree.new_detached_child(parent, "discard me").unwrap();
+        let grandchild = tree.add_child(discarded, "nested", true, false).unwrap();
+        tree.discard_detached(discarded);
+        assert!(!tree.arena.contains(discarded));
+        assert!(!tree.arena.contains(grandchild));
+        assert_eq!(tree.arena[parent].children.len(), 2);
+
+        assert!(matches!(
+            tree.new_detached_child(parent, "   "),
+            Err(TreeError::EmptyText)
+        ));
+    }
 
     #[test]
     fn test_duplicate_children_allowed_at_root_by_empty_rule() {

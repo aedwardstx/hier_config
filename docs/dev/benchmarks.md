@@ -18,20 +18,25 @@ gains in CI.
 ## Executive Summary
 
 On a 10,000-line Cisco IOS configuration (8,823 nodes), hier_config 4.0 achieves
-**3x to 259x speedups** across core operations compared to the pure-Python 3.x
-baseline:
+**5.4x to ~1,000x speedups** across core operations compared to the pure-Python
+3.x baseline:
 
 | Operation | 4.0 (Rust Core) | 3.x (Pure Python) | Speedup | Result Category |
 |---|---:|---:|---:|---|
-| **`copy.deepcopy()`** | **0.52 ms** | 134.56 ms | **259x** | New tree / memory clone |
-| **`get_hconfig` (50k lines)** | **10.04 ms** | 384.76 ms | **38x** | Scalar / tree creation |
-| **`get_hconfig` (10k lines)** | **1.97 ms** | 61.28 ms | **31x** | Scalar / tree creation |
-| **`get_hconfig` (1k lines)** | **0.25 ms** | 7.10 ms | **28x** | Scalar / tree creation |
-| **`config_to_get_to` (remediation)** | **0.98 ms** | 11.55 ms | **12x** | New remediation tree |
-| **`dump()`** | **2.43 ms** | 18.65 ms | **7.7x** | *N* Python objects |
-| **`all_children_sorted()`** | **0.29 ms** | 2.35 ms | **8.1x** | *N* Python objects |
+| **`copy.deepcopy()`** | **0.12 ms** | 123.57 ms | **~1,000x** | New tree / memory clone |
+| **`get_hconfig` (50k lines)** | **4.74 ms** | 364.75 ms | **77x** | Scalar / tree creation |
+| **`get_hconfig` (10k lines)** | **1.03 ms** | 58.07 ms | **57x** |
+| **`get_hconfig` (IOS-XR, 10k lines)** | **1.54 ms** | 84.19 ms | **55x** | Scalar / tree creation |
+| **`get_hconfig` (1k lines)** | **0.17 ms** | 7.16 ms | **43x** | Scalar / tree creation |
+| **`rollback_config`** | **0.54 ms** | 11.34 ms | **21x** | New rollback tree |
+| **`config_to_get_to` (remediation)** | **0.61 ms** | 12.54 ms | **21x** | New remediation tree |
+| **`future()`** | **0.84 ms** | 11.95 ms | **14x** | New projected tree |
+| **`all_children_sorted()`** | **0.31 ms** | 2.51 ms | **8.1x** | *N* Python objects |
+| **`dump()`** | **3.55 ms** | 19.06 ms | **5.4x** | *N* Python objects |
 
-*Measured on Apple Silicon (Apple M2 Max), CPython 3.12, release build (`maturin develop --release`).*
+*Measured on Apple Silicon (Apple M2 Max), CPython 3.12.13, 4.0.0b4 release
+wheel versus hier-config 3.7.0 from PyPI, same interpreter and machine. See
+[Methodology](#methodology) for workloads and sampling.*
 
 ### Real-World Operational Impact
 
@@ -41,7 +46,7 @@ data center switches, and route reflectors:
 1. **Minutes become seconds**: Processing 1,000 devices with 10k-line
    configurations previously required over a minute of pure CPU time just for
    parsing and remediation diffing. In 4.0, the core computation finishes in
-   under 3 seconds.
+   under 2 seconds.
 2. **Elimination of multiprocessing overhead**: In 3.x, CPU-bound tree diffing
    held the Python Global Interpreter Lock (GIL). Parallelizing workloads across
    cores required `multiprocessing`, incurring high memory overhead and
@@ -51,8 +56,8 @@ data center switches, and route reflectors:
    shared memory footprint.
 3. **Sub-millisecond rollbacks and simulations**: Complex simulation workflows
    calling `future()` and computing inverse rollbacks frequently duplicate
-   trees. The 259x speedup in `deepcopy` makes multi-stage state projections
-   virtually instantaneous.
+   trees. `deepcopy` is now ~1,000x faster, and a complete rollback (remediation,
+   future projection and inverse diff) takes 0.54 ms instead of 11.34 ms.
 
 ---
 
@@ -97,7 +102,7 @@ validates rollbacks by cloning the running or remediation tree.
 In Python, `copy.deepcopy` is notoriously slow: it recursively inspects each
 object, looks up its class, checks for `__deepcopy__`, allocates a new instance,
 and maintains a memo dictionary of already-copied references to guard against
-cycles. For an 8,823-node tree, `copy.deepcopy` spent **134.56 ms** just
+cycles. For an 8,823-node tree, `copy.deepcopy` spent **123.57 ms** just
 duplicating Python objects.
 
 ---
@@ -143,9 +148,9 @@ around native Rust primitives:
 3. **Instantaneous Tree Duplication**:
    Because nodes live in an arena and strings are immutable `Arc<str>`
    references, `deepcopy` in 4.0 simply clones the arena's underlying vector and
-   increments string reference counts in native code. What took 134.56 ms in
-   Python takes **0.52 ms** in Rust (down to **0.06 ms** in the hot-path
-   microbenchmark).
+   increments string reference counts in native code. What took 123.57 ms in
+   Python takes **0.12 ms** in Rust (**0.06 ms** on the smaller 400-interface
+   configuration used by the CI regression gate).
 4. **Pre-Compiled Rule Engines**:
    Driver rules, lineage patterns, and sectional overwrite rules are compiled
    into optimized native matchers and regex sets at driver initialization,
@@ -168,38 +173,67 @@ sizes:
 
 | Benchmark Target | Line Count | Node Count | 4.0 Time | 3.x Time | Speedup |
 |---|---:|---:|---:|---:|---:|
-| **Parse (1k lines)** | ~1,000 | ~880 | **0.25 ms** | 7.10 ms | **28.4x** |
-| **Parse (10k lines)** | ~10,000 | 8,823 | **1.97 ms** | 61.28 ms | **31.1x** |
-| **Parse (50k lines)** | ~50,000 | ~44,100 | **10.04 ms** | 384.76 ms | **38.3x** |
-| **Remediation (10k lines)** | ~10,000 | 8,823 | **0.98 ms** | 11.55 ms | **11.8x** |
-| **Remediation (50k lines)** | ~50,000 | ~44,100 | **4.85 ms** | 58.18 ms | **12.0x** |
+| **Parse (1k lines)** | 1,231 | 1,103 | **0.17 ms** | 7.16 ms | **43.1x** |
+| **Parse (10k lines)** | 10,031 | 8,823 | **1.03 ms** | 58.07 ms | **56.6x** |
+| **Parse (50k lines)** | 48,431 | 42,423 | **4.74 ms** | 364.75 ms | **76.9x** |
+| **Parse IOS-XR (10k lines)** | 10,009 | 9,007 | **1.54 ms** | 84.19 ms | **54.6x** |
+| **Remediation (10k lines)** | 10,031 | 8,823 | **0.61 ms** | 12.54 ms | **20.7x** |
+| **Remediation (50k lines)** | 48,431 | 42,423 | **2.53 ms** | 56.65 ms | **22.4x** |
 
-As configuration size increases from 1k to 50k lines, pure Python's parsing
-slows down quadratically under memory pressure and garbage collection overhead,
-while the Rust arena scales linearly with line count.
+As configuration size grows from 1k to 50k lines, pure Python's per-line parse
+cost rises by about 30% (5.8 µs to 7.5 µs per line) under allocator and
+garbage-collection pressure, while the Rust arena stays flat at roughly
+0.1 µs per line. The speedup therefore widens with configuration size.
+
+IOS-XR parsing costs more than IOS in both versions because its driver adjusts
+indentation with a lookahead regular expression evaluated on every line. The
+4.0 regex cache screens each line with a linear-time prefilter derived from
+that expression, so the backtracking engine runs only on candidate lines.
 
 ### 2. Operational Breakdown on 10k-Line Benchmark
 
-Min-of-25 wall clock timings on a generated 10,000-line Cisco IOS configuration
-(8,823 nodes) comparing the 4.0 release build against the 3.x baseline:
+Wall-clock timings on the generated 10,000-line Cisco IOS configuration
+(8,823 nodes), plus the future/rollback workload described in
+[Methodology](#methodology), comparing the 4.0 release build against the 3.x
+baseline:
 
 ```
 Operation          4.0 (Rust)        3.x (Python)     Speedup
 ─────────────────────────────────────────────────────────────
-deepcopy              0.52 ms          134.56 ms       259.0x  ████████████████████
-get_hconfig (50k)    10.04 ms          384.76 ms        38.3x  ███
-get_hconfig (10k)     1.97 ms           61.28 ms        31.1x  ██
-config_to_get_to      0.98 ms           11.55 ms        11.8x  █
-all_children_sorted   0.29 ms            2.35 ms         8.1x  ▋
-dump()                2.43 ms           18.65 ms         7.7x  ▌
+deepcopy              0.12 ms          123.57 ms      ~1000x   ████████████████████
+get_hconfig (50k)     4.74 ms          364.75 ms        76.9x  █▌
+get_hconfig (10k)     1.03 ms           58.07 ms        56.6x  █▏
+get_hconfig (XR 10k)  1.54 ms           84.19 ms        54.6x  █
+rollback_config       0.54 ms           11.34 ms        20.9x  ▍
+config_to_get_to      0.61 ms           12.54 ms        20.7x  ▍
+future()              0.84 ms           11.95 ms        14.2x  ▎
+all_children_sorted   0.31 ms            2.51 ms         8.1x  ▏
+dump()                3.55 ms           19.06 ms         5.4x  ▏
 ```
+
+### Methodology
+
+- **Environments**: two fresh CPython 3.12.13 virtual environments on the same
+  machine, one with `hier-config==3.7.0` from PyPI and one with the 4.0 release
+  wheel (`maturin build --release --locked`). Scripts run from outside the
+  repository so the source tree cannot shadow either install.
+- **Workloads**: configurations come from `_generate_large_ios_config()` and
+  `_generate_large_xr_config()` in `tests/benchmarks/test_benchmarks.py`. The
+  1k, 10k and 50k IOS configurations use 120, 1,200 and 6,000 interfaces.
+  Remediation changes the OSPF cost on 100 (10k) or 200 (50k) interfaces.
+  `future()` and `rollback_config` use the 1,000-interface (8,431-line)
+  configuration with 100 changed interfaces; rollback builds a fresh
+  `WorkflowRemediation` per sample so nothing is cached.
+- **Sampling**: minimum of 25 samples per operation (5 for `deepcopy` and the
+  50k cases), taking the better of two complete runs. The two runs agreed
+  within about 3% for every operation.
 
 ---
 
 ## The CPython Allocation Boundary
 
-Notice that the speedups range from **7.7x** to **259x**. Why is the spread not
-uniform?
+Notice that the speedups range from **5.4x** to **~1,000x**. Why is the spread
+not uniform?
 
 The answer lies in **what an operation returns** and whether it crosses the
 CPython allocation boundary.
@@ -208,8 +242,8 @@ CPython allocation boundary.
 
 | Category | Operations | What Returns to Python | Primary Cost Driver | Speedup Range |
 |---|---|---|---|---|
-| **Rust-Bound** | `parse`, `fast_load`, `deepcopy`, `remediation` | A single scalar, string, or root handle | Native Rust execution | **12x – 259x** |
-| **CPython-Bound** | `dump()`, `all_children_sorted()` | *N* individual Python objects (one per node) | CPython object allocation & GC | **7x – 8x** |
+| **Rust-Bound** | `parse`, `deepcopy`, `remediation`, `future`, `rollback` | A single scalar, string, or root handle | Native Rust execution | **14x – ~1,000x** |
+| **CPython-Bound** | `dump()`, `all_children_sorted()` | *N* individual Python objects (one per node) | CPython object allocation & GC | **5.4x – 8x** |
 
 ### The Math of Object Materialization
 
@@ -227,7 +261,7 @@ How fast can CPython allocate 8,823 objects?
 Direct micro-benchmarks measuring pure CPython allocation show:
 - Allocating 8,823 *empty* Python `__slots__` objects (`object.__new__`) costs
   **0.537 ms**.
-- The entire pure-Python 3.x traversal took 2.348 ms.
+- The entire pure-Python 3.x traversal took 2.348 ms in that experiment.
 
 $$\text{Theoretical Speedup Ceiling} = \frac{2.348\text{ ms}}{0.537\text{ ms}} \approx 4.4\text{x}$$
 
@@ -266,8 +300,8 @@ In pure Python:
 
 In 4.0, Rust populates the underlying Python instance dictionaries directly
 via the Python C-API without executing Python bytecode. As a result, 4.0
-achieves **2.43 ms** for `dump()` — **faster than the theoretical pure-Python
-allocation floor**.
+achieves **3.55 ms** for `dump()` — still below the 3.86 ms pure-Python
+construction floor, and 5.4x faster than 3.x.
 
 ---
 
@@ -383,6 +417,32 @@ every regression will be detected or attribute a failure to code rather than
 runner effects.
 
 ---
+
+## Future and Rollback Regression Checks
+
+Build the release extension before measuring; use `--no-sync` afterward so uv
+does not replace it with a cached build:
+
+```bash
+uv run --no-sync maturin develop --release --locked
+uv run --no-sync pytest -m benchmark tests/benchmarks/test_benchmarks.py -v -s
+```
+
+The future and rollback cases use 1,000 IOS interfaces (8,431 input lines),
+changing the OSPF cost on 100 interfaces. Future timing excludes remediation
+generation. Rollback timing creates a fresh `WorkflowRemediation` each time,
+including remediation generation and future projection rather than reading
+a warmed rollback cache. Correctness assertions run outside the timed region.
+
+A separate Generic-platform test projects 1,000 and 4,000 new top-level lines
+onto equally sized running configs. Four times the input may take at most
+eight times as long: this tolerates timing noise while detecting a quadratic
+negated-counterpart sibling scan. Indexed exact-text lookup must remain indexed
+even when reducing temporary string allocations.
+
+For before/after comparisons, keep the pre-change release binary and run both
+builds in alternation on the same interpreter and machine. Differences within
+about 2% are run-to-run noise.
 
 ## Where to Look Next
 

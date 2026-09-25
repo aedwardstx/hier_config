@@ -38,49 +38,41 @@ impl PreparedSubs {
     ///
     /// Most configuration lines match none of the rules, so a combined `RegexSet`
     /// rejects them in a single pass instead of scanning once per rule. For a line that
-    /// does match, the same set reports *which* rules matched: while the text is still
-    /// untouched it is exactly the original line, so a rule the set excluded provably
-    /// cannot match and is skipped without running it. Once a rule rewrites the text
-    /// that reasoning no longer holds, so every remaining rule runs as before — which
-    /// keeps the result identical to a plain sequential pass.
+    /// does match, the same set reports *which* rules match the current text; a rule
+    /// it excludes provably leaves that text untouched and is skipped without running
+    /// it. After a rule rewrites the text the set is consulted again on the result,
+    /// which keeps the outcome identical to a plain sequential pass.
     fn apply<'a>(&self, line: &'a str) -> Cow<'a, str> {
-        let candidates = match &self.prefilter {
-            Some(prefilter) => {
-                if !prefilter.is_match(line) {
-                    return Cow::Borrowed(line);
+        let mut text = Cow::Borrowed(line);
+        let Some(prefilter) = &self.prefilter else {
+            for (re, replace) in &self.rules {
+                if let Cow::Owned(replaced) = re.replace_all(&text, replace.as_str()) {
+                    text = Cow::Owned(replaced);
                 }
-                Some(prefilter.matches(line))
             }
-            None => None,
+            return text;
         };
+        if !prefilter.is_match(line) {
+            return text;
+        }
 
-        let mut owned: Option<String> = None;
+        let mut candidates = prefilter.matches(line);
         for (index, (re, replace)) in self.rules.iter().enumerate() {
-            if owned.is_none()
-                && let Some(candidates) = &candidates
-                && !candidates.matched(index)
-            {
+            if !candidates.matched(index) {
                 continue;
             }
-
-            let replaced = {
-                let current: &str = owned.as_deref().unwrap_or(line);
-                match re.replace_all(current, replace.as_str()) {
-                    Cow::Borrowed(_) => None,
-                    Cow::Owned(replaced) => Some(replaced),
-                }
-            };
-            if let Some(replaced) = replaced {
-                owned = Some(replaced);
+            if let Cow::Owned(replaced) = re.replace_all(&text, replace.as_str()) {
+                candidates = prefilter.matches(&replaced);
+                text = Cow::Owned(replaced);
             }
         }
-        owned.map_or(Cow::Borrowed(line), Cow::Owned)
+        text
     }
 }
 
 /// Converts a Juniper / `VyOS` / Nokia style config string into a list of set commands.
 pub fn convert_to_set_commands(config_raw: &str) -> String {
-    let mut path: Vec<String> = Vec::new();
+    let mut path: Vec<&str> = Vec::new();
     let mut set_commands: Vec<String> = Vec::new();
 
     for line in config_raw.lines() {
@@ -102,7 +94,7 @@ pub fn convert_to_set_commands(config_raw: &str) -> String {
         if stripped.ends_with('{') || stripped.ends_with('}') {
             let section = stripped.trim_end_matches(['{', '}']).trim();
             if !section.is_empty() {
-                path.push(section.to_string());
+                path.push(section);
             }
         } else if stripped.starts_with("set ") || stripped.starts_with("delete ") {
             set_commands.push(stripped.to_string());
@@ -265,7 +257,33 @@ pub fn load_from_str(tree: &mut Tree, config_raw: &str) -> Result<(), TreeError>
 /// rebuilding it word by word. Any non-ASCII byte takes the slow path, because
 /// `split_whitespace` is Unicode-aware and this scan is not.
 fn is_already_normalized(rest: &[u8]) -> bool {
+    const SPACES: u64 = u64::from_le_bytes([b' '; 8]);
+    const LOW: u64 = u64::from_le_bytes([0x7f; 8]);
+    const HIGH: u64 = u64::from_le_bytes([0x80; 8]);
+    const LAST: u64 = 0x80 << 56;
+
+    // Eight bytes at a time: a word of printable ASCII and single spaces needs no
+    // per-byte work. Any other byte hands the rest of the line to the exact scan.
+    let (words, tail) = rest.as_chunks::<8>();
     let mut prev_space = false;
+    for (position, word) in words.iter().enumerate() {
+        let word = u64::from_le_bytes(*word);
+        if (word | word.wrapping_sub(SPACES) & !word) & HIGH != 0 {
+            return is_normalized_from(&rest[position * 8..], prev_space);
+        }
+        let not_space = word ^ SPACES;
+        let spaces = !((not_space & LOW).wrapping_add(LOW) | not_space | LOW);
+        if spaces & (spaces >> 8 | u64::from(prev_space) << 7) != 0 {
+            return false;
+        }
+        prev_space = spaces & LAST != 0;
+    }
+    is_normalized_from(tail, prev_space)
+}
+
+/// Byte-at-a-time form of [`is_already_normalized`], resuming after a space when
+/// `prev_space` is set.
+fn is_normalized_from(rest: &[u8], mut prev_space: bool) -> bool {
     for &b in rest {
         if !b.is_ascii() {
             return false;
@@ -292,24 +310,51 @@ fn is_already_normalized(rest: &[u8]) -> bool {
 /// bytes (not characters) keeps the result usable as a slice index and matches the
 /// number of spaces `normalize_whitespace` re-emits.
 pub(crate) fn leading_whitespace_len(line: &str) -> usize {
-    line.len() - line.trim_start().len()
+    // Indentation is almost always plain spaces followed by printable ASCII; only
+    // anything else needs the Unicode-aware scan.
+    let spaces = line.bytes().take_while(|&byte| byte == b' ').count();
+    match line.as_bytes().get(spaces) {
+        Some(byte) if byte.is_ascii_graphic() => spaces,
+        _ => line.len() - line.trim_start().len(),
+    }
 }
 
-/// Returns `true` for the characters Python's `str.splitlines()` treats as line
-/// boundaries but `str::lines()` ignores.
-const fn is_line_boundary(character: char) -> bool {
-    matches!(
-        character,
-        '\n' | '\r'
-            | '\u{0b}'
-            | '\u{0c}'
-            | '\u{1c}'
-            | '\u{1d}'
-            | '\u{1e}'
-            | '\u{85}'
-            | '\u{2028}'
-            | '\u{2029}'
-    )
+/// Finds the first line boundary Python's `str.splitlines()` recognises in
+/// `bytes`, returning its byte offset and encoded length.
+///
+/// Every boundary begins with an ASCII control byte below `0x1f` or a non-ASCII
+/// lead byte (NEL, LS and PS), so eight-byte words holding neither are skipped in
+/// one step; ordinary configuration text is almost entirely such words.
+fn find_line_boundary(bytes: &[u8]) -> Option<(usize, usize)> {
+    const LOW: u64 = u64::from_ne_bytes([0x1f; 8]);
+    const HIGH: u64 = u64::from_ne_bytes([0x80; 8]);
+    let mut index = 0;
+    while index < bytes.len() {
+        if let Some(word) = bytes.get(index..index + 8) {
+            let word = u64::from_ne_bytes(word.try_into().unwrap_or_default());
+            if (word.wrapping_sub(LOW) & !word | word) & HIGH == 0 {
+                index += 8;
+                continue;
+            }
+        }
+        let width = match bytes[index] {
+            b'\n' | b'\r' | 0x0b | 0x0c | 0x1c..=0x1e => 1,
+            // U+0085 NEXT LINE.
+            0xc2 if bytes.get(index + 1) == Some(&0x85) => 2,
+            // U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR.
+            0xe2 if bytes.get(index + 1) == Some(&0x80)
+                && matches!(bytes.get(index + 2), Some(0xa8 | 0xa9)) =>
+            {
+                3
+            }
+            _ => {
+                index += 1;
+                continue;
+            }
+        };
+        return Some((index, width));
+    }
+    None
 }
 
 /// Iterator returned by [`splitlines`].
@@ -323,14 +368,13 @@ impl<'a> Iterator for SplitLines<'a> {
 
     fn next(&mut self) -> Option<&'a str> {
         let rest = self.rest?;
-        let Some((index, character)) = rest.char_indices().find(|(_, c)| is_line_boundary(*c))
-        else {
+        let Some((index, width)) = find_line_boundary(rest.as_bytes()) else {
             self.rest = None;
             return (!rest.is_empty()).then_some(rest);
         };
         let line = &rest[..index];
-        let mut next_start = index + character.len_utf8();
-        if character == '\r' && rest[next_start..].starts_with('\n') {
+        let mut next_start = index + width;
+        if rest.as_bytes()[index] == b'\r' && rest.as_bytes().get(next_start) == Some(&b'\n') {
             next_start += 1;
         }
         self.rest = Some(&rest[next_start..]);
@@ -542,7 +586,10 @@ pub fn parse_into_tree(tree: &mut Tree, config_raw: &str) -> Result<(), TreeErro
 
     // Most lines become a node, so sizing the arena up front avoids repeatedly
     // reallocating and copying the node table while parsing a large configuration.
-    tree.arena.reserve(splitlines(&config_text).count());
+    // Estimated from the byte length (configuration lines average about 25
+    // bytes) because even counting newlines costs a full extra pass; a miss only
+    // means one extra reallocation.
+    tree.arena.reserve(config_text.len() / 24 + 1);
 
     for raw_line in splitlines(&config_text) {
         if state.banner.in_banner {
@@ -785,6 +832,31 @@ pub fn from_dump(driver: Driver, dump: &Dump) -> Result<Tree, TreeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn word_at_a_time_normalization_check_matches_the_byte_scan() {
+        const ALPHABET: [u8; 6] = [b'a', b' ', b' ', b'\t', 0x01, 0xc3];
+        let mut state: u32 = 0x9e37_79b9;
+        for _ in 0..50_000 {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            let len = state as usize % 30;
+            let bytes: Vec<u8> = (0u32..)
+                .take(len)
+                .map(|offset| ALPHABET[(state.rotate_left(offset * 3) % 6) as usize])
+                .collect();
+            assert_eq!(
+                is_already_normalized(&bytes),
+                is_normalized_from(&bytes, false),
+                "{bytes:?}"
+            );
+        }
+        // Double spaces straddling, and a trailing space ending, an eight-byte word.
+        assert!(!is_already_normalized(b"abcdefg  hijklmnop"));
+        assert!(!is_already_normalized(b"abcdefgh "));
+        assert!(is_already_normalized(b"abcdefg hijklmno p"));
+    }
 
     #[test]
     fn test_is_end_of_banner() {

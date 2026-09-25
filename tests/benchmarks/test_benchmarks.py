@@ -6,11 +6,13 @@ These tests are skipped by default. Run with:
 
 import time
 from collections.abc import Callable
+from functools import partial
 
 import pytest
 
 from hier_config import HConfig
 from hier_config.models import Platform
+from hier_config.workflows import WorkflowRemediation
 
 pytestmark = pytest.mark.benchmark
 
@@ -251,6 +253,70 @@ class TestRemediationBenchmarks:
         elapsed = _time_fn(lambda: running.remediation(generated))
         print(f"\nRemediation (completely different): {elapsed:.4f}s")
         assert elapsed < 10.0, f"Remediation took {elapsed:.2f}s, expected < 10s"
+
+    @staticmethod
+    def test_future_config_large() -> None:
+        """Compute future config from running and remediation."""
+        running_text = _generate_large_ios_config()
+        running = HConfig.from_text(Platform.CISCO_IOS, running_text)
+        generated_text = running_text.replace(
+            " ip ospf cost 100", " ip ospf cost 200", 100
+        )
+        generated = HConfig.from_text(Platform.CISCO_IOS, generated_text)
+        remediation = running.remediation(generated)
+        assert len(remediation.children) == 100
+        assert not tuple(running.future(remediation).unified_diff(generated))
+
+        elapsed = _time_fn(lambda: running.future(remediation))
+        print(f"\nFuture config (100 modified interfaces): {elapsed:.4f}s")
+        assert elapsed < 5.0, (
+            f"Future config calculation took {elapsed:.2f}s, expected < 5s"
+        )
+
+    @staticmethod
+    def test_rollback_workflow_large() -> None:
+        """Compute rollback config via WorkflowRemediation."""
+        running_text = _generate_large_ios_config()
+        running = HConfig.from_text(Platform.CISCO_IOS, running_text)
+        generated_text = running_text.replace(
+            " ip ospf cost 100", " ip ospf cost 200", 100
+        )
+        generated = HConfig.from_text(Platform.CISCO_IOS, generated_text)
+        workflow = WorkflowRemediation(running, generated)
+        projected = running.future(workflow.remediation_config)
+        assert not tuple(
+            projected.future(workflow.rollback_config).unified_diff(running)
+        )
+
+        def run_workflow() -> None:
+            wf = WorkflowRemediation(running, generated)
+            _ = wf.rollback_config
+
+        elapsed = _time_fn(run_workflow)
+        print(f"\nWorkflowRemediation rollback_config: {elapsed:.4f}s")
+        assert elapsed < 5.0, f"Rollback workflow took {elapsed:.2f}s, expected < 5s"
+
+    @staticmethod
+    def test_future_flat_additions_scale_linearly() -> None:
+        """Reject a per-addition sibling scan in future negated-counterpart lookup."""
+        timings: list[float] = []
+        for size in (1000, 4000):
+            running = HConfig.from_lines(
+                Platform.GENERIC, tuple(f"existing {i}" for i in range(size))
+            )
+            changes = HConfig.from_lines(
+                Platform.GENERIC, tuple(f"new {i}" for i in range(size))
+            )
+            expected = changes.to_lines() + running.to_lines()
+            assert running.future(changes).to_lines() == expected
+            elapsed = _time_fn(partial(running.future, changes), iterations=7)
+            timings.append(elapsed)
+            print(f"\nFuture flat additions ({size} + {size} lines): {elapsed:.6f}s")
+
+        # Four times the input permits 2x headroom, but not quadratic (~16x) growth.
+        assert timings[1] <= timings[0] * 8, (
+            f"Flat future scaling is superlinear: {timings[1] / timings[0]:.2f}x"
+        )
 
 
 class TestIterationBenchmarks:

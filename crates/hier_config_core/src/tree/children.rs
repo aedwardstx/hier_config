@@ -2,6 +2,7 @@ use crate::arena::{Arena, NodeId};
 use crate::tree::node::Node;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::Arc;
 
 /// Text-keyed index from a child's text to the *first* child that carries it.
@@ -14,22 +15,88 @@ use std::sync::Arc;
 /// integers/`NodeId`s are not reachable this way and keep using `FxHashMap`.
 type Mapping = HashMap<Arc<str>, NodeId>;
 
+/// Largest index kept as a linear list before it is promoted to a [`Mapping`].
+///
+/// Most parents in a real configuration have a handful of children. Comparing a
+/// few keys directly is cheaper than hashing the line with `SipHash`, and bounding
+/// the list keeps each scan constant-time, so hash-flooding protection holds.
+const LINEAR_INDEX_MAX: usize = 8;
+
+/// Text index behind [`Children`], sized to the number of indexed children.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+enum Index {
+    Linear(Vec<(Arc<str>, NodeId)>),
+    Hashed(Mapping),
+}
+
+impl Index {
+    /// An empty index, sized so it never regrows before promotion.
+    fn new() -> Self {
+        Self::Linear(Vec::with_capacity(LINEAR_INDEX_MAX))
+    }
+
+    fn get(&self, text: &str) -> Option<NodeId> {
+        match self {
+            Self::Linear(entries) => entries
+                .iter()
+                .find(|(key, _)| key.as_ref() == text)
+                .map(|&(_, id)| id),
+            Self::Hashed(mapping) => mapping.get(text).copied(),
+        }
+    }
+
+    /// Records `id` for `text` unless an earlier child already claimed it, in
+    /// which case that child's id is returned instead.
+    fn insert_first(&mut self, text: &Arc<str>, id: NodeId) -> Option<NodeId> {
+        match self {
+            Self::Linear(entries) => {
+                if let Some(&(_, existing)) = entries.iter().find(|(key, _)| key == text) {
+                    return Some(existing);
+                }
+                if entries.len() < LINEAR_INDEX_MAX {
+                    entries.push((Arc::clone(text), id));
+                    return None;
+                }
+                let mut mapping: Mapping = entries.drain(..).collect();
+                mapping.insert(Arc::clone(text), id);
+                *self = Self::Hashed(mapping);
+                None
+            }
+            Self::Hashed(mapping) => match mapping.entry(Arc::clone(text)) {
+                Entry::Occupied(entry) => Some(*entry.get()),
+                Entry::Vacant(entry) => {
+                    entry.insert(id);
+                    None
+                }
+            },
+        }
+    }
+
+    fn keys(&self) -> Box<dyn Iterator<Item = &str> + '_> {
+        match self {
+            Self::Linear(entries) => Box::new(entries.iter().map(|(key, _)| key.as_ref())),
+            Self::Hashed(mapping) => Box::new(mapping.keys().map(Arc::as_ref)),
+        }
+    }
+}
+
 /// Ordered collection of child `NodeId`s with fast text-keyed lookup.
 ///
 /// Preserves insertion order in a `Vec<NodeId>` while mapping `child.text` to the
 /// *first* occurrence of a child with that text.
 ///
-/// Two details keep this cheap on large configurations. The map is boxed and only
-/// allocated once a child is appended with mapping enabled, so the leaf nodes that
-/// make up most of a parsed tree carry a single null pointer rather than an empty
-/// hash table. Its keys are `Arc<str>` shared with the node itself, so indexing a
-/// child is a reference-count bump instead of a second copy of every configuration
-/// line.
+/// Three details keep this cheap on large configurations. The index is boxed and
+/// only allocated once a child is appended with mapping enabled, so the leaf nodes
+/// that make up most of a parsed tree carry a single null pointer rather than an
+/// empty hash table. Small indexes are a linear list rather than a hash table (see
+/// [`LINEAR_INDEX_MAX`]). Its keys are `Arc<str>` shared with the node itself, so
+/// indexing a child is a reference-count bump instead of a second copy of every
+/// configuration line.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Children {
     data: Vec<NodeId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    mapping: Option<Box<Mapping>>,
+    mapping: Option<Box<Index>>,
 }
 
 impl Children {
@@ -53,14 +120,12 @@ impl Children {
 
     /// Looks up a child by exact text match (returns the first matching child).
     pub fn get(&self, text: &str) -> Option<NodeId> {
-        self.mapping.as_ref()?.get(text).copied()
+        self.mapping.as_ref()?.get(text)
     }
 
     /// Checks if a child with `text` exists.
     pub fn contains(&self, text: &str) -> bool {
-        self.mapping
-            .as_ref()
-            .is_some_and(|mapping| mapping.contains_key(text))
+        self.get(text).is_some()
     }
 
     /// Retrieves a child by index.
@@ -91,10 +156,31 @@ impl Children {
         self.data.push(child_id);
         if update_mapping {
             self.mapping
-                .get_or_insert_with(|| Box::new(Mapping::default()))
-                .entry(Arc::clone(text))
-                .or_insert(child_id);
+                .get_or_insert_with(|| Box::new(Index::new()))
+                .insert_first(text, child_id);
         }
+    }
+
+    /// Indexes `text` for the child that will be appended as `child_id`, in a
+    /// single lookup.
+    ///
+    /// Returns the existing child's id, leaving the collection untouched, when a
+    /// child with `text` is already indexed. Otherwise `child_id` is indexed and
+    /// the caller must follow with [`Self::push_claimed`].
+    pub(crate) fn claim(&mut self, text: &Arc<str>, child_id: NodeId) -> Option<NodeId> {
+        self.mapping
+            .get_or_insert_with(|| Box::new(Index::new()))
+            .insert_first(text, child_id)
+    }
+
+    /// Appends a child whose text was indexed by [`Self::claim`].
+    pub(crate) fn push_claimed(&mut self, child_id: NodeId) {
+        // A parent that gains one child usually gains several; size for a few
+        // at once rather than regrowing 0 -> 4 -> 8.
+        if self.data.is_empty() {
+            self.data.reserve_exact(LINEAR_INDEX_MAX);
+        }
+        self.data.push(child_id);
     }
 
     /// Replaces child at `index` and rebuilds the text mapping.
@@ -149,21 +235,17 @@ impl Children {
             self.mapping = None;
             return;
         }
-        let mapping = self
-            .mapping
-            .get_or_insert_with(|| Box::new(Mapping::default()));
-        mapping.clear();
+        let mut index = Index::new();
         for &id in &self.data {
             if let Some(node) = arena.get(id) {
-                mapping.entry(Arc::clone(&node.text)).or_insert(id);
+                index.insert_first(&node.text, id);
             }
         }
+        self.mapping = Some(Box::new(index));
     }
 
     /// Returns an iterator over all keys in the mapping.
     pub fn keys(&self) -> impl Iterator<Item = &str> {
-        self.mapping
-            .iter()
-            .flat_map(|mapping| mapping.keys().map(Arc::as_ref))
+        self.mapping.iter().flat_map(|index| index.keys())
     }
 }

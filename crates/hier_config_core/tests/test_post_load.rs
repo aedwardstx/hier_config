@@ -95,3 +95,93 @@ fn test_cisco_xr_comments_fixup() {
             .contains("interface comment")
     );
 }
+
+#[test]
+fn trailing_top_level_exit_is_preserved() {
+    // Invariant guard: the sectional-exit sweep must only touch descendants. Applied to
+    // the root, it would delete a trailing top-level `exit` line, because the root
+    // reports the platform default exit text once it has children.
+    let raw = "interface Ethernet1\n description x\n exit\nvlan 10\nexit\n";
+    let tree = Tree::from_str(Platform::CiscoIos, raw).unwrap();
+    assert_eq!(
+        tree.dump_simple(false),
+        vec!["interface Ethernet1", "  description x", "vlan 10", "exit"]
+    );
+}
+
+#[test]
+fn trailing_top_level_quit_is_preserved_on_huawei_vrp() {
+    // Same invariant with the Huawei VRP `quit` spelling of the exit command.
+    let raw = "interface Ethernet1\n description x\n quit\nquit\n";
+    let tree = Tree::from_str(Platform::HuaweiVrp, raw).unwrap();
+    assert_eq!(
+        tree.dump_simple(false),
+        vec!["interface Ethernet1", "  description x", "quit"]
+    );
+}
+
+#[test]
+fn nested_sectional_exits_are_removed_at_every_depth() {
+    let raw = concat!(
+        "router bgp 65000\n",
+        " address-family ipv4\n",
+        "  network 10.0.0.0\n",
+        "  exit-address-family\n",
+        " exit\n",
+    );
+    let tree = Tree::from_str(Platform::CiscoIos, raw).unwrap();
+    assert_eq!(
+        tree.dump_simple(false),
+        vec![
+            "router bgp 65000",
+            "  address-family ipv4",
+            "    network 10.0.0.0",
+        ]
+    );
+}
+
+#[test]
+fn every_sibling_section_loses_its_trailing_exit() {
+    // The sweep walks children by index while `delete_sectional_exit` removes a child
+    // of the node it is given, so no sibling may be skipped over by the deletions.
+    let raw = concat!(
+        "interface Ethernet1\n description a\n exit\n",
+        "interface Ethernet2\n description b\n exit\n",
+        "interface Ethernet3\n description c\n exit\n",
+    );
+    let tree = Tree::from_str(Platform::CiscoIos, raw).unwrap();
+    assert_eq!(
+        tree.dump_simple(false),
+        vec![
+            "interface Ethernet1",
+            "  description a",
+            "interface Ethernet2",
+            "  description b",
+            "interface Ethernet3",
+            "  description c",
+        ]
+    );
+}
+
+#[test]
+fn interior_exit_lines_and_leaf_siblings_are_left_alone() {
+    // Only a *trailing* exit is sectional; one followed by more configuration stays,
+    // and childless siblings the sweep skips are untouched either way.
+    let raw = concat!(
+        "interface Ethernet1\n description a\n exit\n shutdown\n",
+        "hostname router1\n",
+        "exit\n",
+    );
+    let tree = Tree::from_str(Platform::CiscoIos, raw).unwrap();
+    assert_eq!(
+        tree.dump_simple(false),
+        vec![
+            "interface Ethernet1",
+            "  description a",
+            "  exit",
+            "  shutdown",
+            "hostname router1",
+            "exit",
+        ]
+    );
+}

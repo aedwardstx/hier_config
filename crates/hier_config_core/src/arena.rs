@@ -79,6 +79,23 @@ impl<T> Arena<T> {
         self.len == 0
     }
 
+    /// Returns the `NodeId` the next [`Self::insert`] will hand out.
+    pub fn next_id(&self) -> NodeId {
+        self.free_head.map_or_else(
+            || NodeId {
+                index: slot_index(self.slots.len()),
+                generation: 1,
+            },
+            |free_idx| match &self.slots[free_idx as usize] {
+                Slot::Vacant { generation, .. } => NodeId {
+                    index: free_idx,
+                    generation: generation.wrapping_add(1).max(1),
+                },
+                Slot::Occupied { .. } => unreachable!("free_head pointed to an occupied slot"),
+            },
+        )
+    }
+
     /// Allocates a new value in the arena and returns its `NodeId`.
     ///
     /// # Panics
