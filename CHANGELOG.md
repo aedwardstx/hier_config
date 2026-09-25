@@ -235,6 +235,12 @@ v4 design decisions, for the record:
 
 ### Changed
 
+- Line splitting jumps straight to the first candidate byte of each
+  eight-byte word instead of re-scanning it byte by byte, cutting
+  `splitlines()` time by roughly a third on IOS and XR configurations
+  (about 3% of total parse time). It stays pure integer code with no
+  new dependencies; portable SIMD (`std::simd`, `fearless_simd`) was
+  evaluated and measured no faster for these per-line scans.
 - Future/rollback projection skips the source pre-pass when there are no
   replacement-negation rules and matches prefix
   negations without temporary strings. The exact negated-counterpart lookup

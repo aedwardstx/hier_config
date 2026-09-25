@@ -324,37 +324,57 @@ pub(crate) fn leading_whitespace_len(line: &str) -> usize {
 ///
 /// Every boundary begins with an ASCII control byte below `0x1f` or a non-ASCII
 /// lead byte (NEL, LS and PS), so eight-byte words holding neither are skipped in
-/// one step; ordinary configuration text is almost entirely such words.
+/// one step; ordinary configuration text is almost entirely such words. A word that
+/// does hold one jumps straight to its first candidate byte.
+///
+/// Called once per line from [`SplitLines::next`]; lines average ~26 bytes, so
+/// keeping it inlinable matters as much as the scan. Portable SIMD (`std::simd`,
+/// `fearless_simd`) measured no faster than this once both were inlined, and a
+/// movemask-style version was slower on NEON.
+#[inline]
 fn find_line_boundary(bytes: &[u8]) -> Option<(usize, usize)> {
-    const LOW: u64 = u64::from_ne_bytes([0x1f; 8]);
-    const HIGH: u64 = u64::from_ne_bytes([0x80; 8]);
+    const LOW: u64 = u64::from_le_bytes([0x1f; 8]);
+    const HIGH: u64 = u64::from_le_bytes([0x80; 8]);
     let mut index = 0;
-    while index < bytes.len() {
-        if let Some(word) = bytes.get(index..index + 8) {
-            let word = u64::from_ne_bytes(word.try_into().unwrap_or_default());
-            if (word.wrapping_sub(LOW) & !word | word) & HIGH == 0 {
-                index += 8;
-                continue;
-            }
+    while let Some(word) = bytes.get(index..index + 8) {
+        let word = u64::from_le_bytes(word.try_into().unwrap_or_default());
+        let candidates = (word.wrapping_sub(LOW) & !word | word) & HIGH;
+        if candidates == 0 {
+            index += 8;
+            continue;
         }
-        let width = match bytes[index] {
-            b'\n' | b'\r' | 0x0b | 0x0c | 0x1c..=0x1e => 1,
-            // U+0085 NEXT LINE.
-            0xc2 if bytes.get(index + 1) == Some(&0x85) => 2,
-            // U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR.
-            0xe2 if bytes.get(index + 1) == Some(&0x80)
-                && matches!(bytes.get(index + 2), Some(0xa8 | 0xa9)) =>
-            {
-                3
-            }
-            _ => {
-                index += 1;
-                continue;
-            }
-        };
-        return Some((index, width));
+        // A borrow can only flag bytes above a genuine candidate, so the lowest
+        // flagged byte is always real.
+        index += (candidates.trailing_zeros() / 8) as usize;
+        if let Some(width) = line_boundary_width(bytes, index) {
+            return Some((index, width));
+        }
+        index += 1;
+    }
+    while index < bytes.len() {
+        if let Some(width) = line_boundary_width(bytes, index) {
+            return Some((index, width));
+        }
+        index += 1;
     }
     None
+}
+
+/// Encoded length of the line boundary starting at `bytes[index]`, if any.
+#[inline]
+fn line_boundary_width(bytes: &[u8], index: usize) -> Option<usize> {
+    match bytes[index] {
+        b'\n' | b'\r' | 0x0b | 0x0c | 0x1c..=0x1e => Some(1),
+        // U+0085 NEXT LINE.
+        0xc2 if bytes.get(index + 1) == Some(&0x85) => Some(2),
+        // U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR.
+        0xe2 if bytes.get(index + 1) == Some(&0x80)
+            && matches!(bytes.get(index + 2), Some(0xa8 | 0xa9)) =>
+        {
+            Some(3)
+        }
+        _ => None,
+    }
 }
 
 /// Iterator returned by [`splitlines`].
@@ -856,6 +876,69 @@ mod tests {
         assert!(!is_already_normalized(b"abcdefg  hijklmnop"));
         assert!(!is_already_normalized(b"abcdefgh "));
         assert!(is_already_normalized(b"abcdefg hijklmno p"));
+    }
+
+    fn byte_scan_line_boundary(bytes: &[u8]) -> Option<(usize, usize)> {
+        (0..bytes.len()).find_map(|index| {
+            let rest = &bytes[index..];
+            let width = match rest {
+                [b'\n' | b'\r' | 0x0b | 0x0c | 0x1c..=0x1e, ..] => 1,
+                [0xc2, 0x85, ..] => 2,
+                [0xe2, 0x80, 0xa8 | 0xa9, ..] => 3,
+                _ => return None,
+            };
+            Some((index, width))
+        })
+    }
+
+    #[test]
+    fn word_at_a_time_line_boundary_matches_the_byte_scan() {
+        // Boundaries, near-miss control and lead bytes, and filler.
+        const ALPHABET: [u8; 13] = [
+            b'a', b'z', b' ', b'\t', b'\n', b'\r', 0x1c, 0x1f, 0x01, 0xc2, 0x85, 0xe2, 0x80,
+        ];
+        let mut state: u32 = 0x9e37_79b9;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as usize
+        };
+        for _ in 0..50_000 {
+            let len = next() % 40;
+            let mut bytes: Vec<u8> = (0..len)
+                .map(|_| ALPHABET[next() % ALPHABET.len()])
+                .collect();
+            if len > 3 && next() % 4 == 0 {
+                let at = next() % (len - 2);
+                bytes[at..at + 3].copy_from_slice(&[0xe2, 0x80, 0xa8]);
+            }
+            assert_eq!(
+                find_line_boundary(&bytes),
+                byte_scan_line_boundary(&bytes),
+                "{bytes:?}"
+            );
+        }
+        // A lone candidate byte at every offset around the eight-byte word edges,
+        // including a non-boundary control byte followed by a real one in the same word.
+        for offset in 0..24 {
+            for candidate in [
+                &b"\n"[..],
+                b"\x01\n",
+                b"\xc2\x85",
+                b"\xe2\x80\xa9",
+                b"\xc3\xa9\r",
+            ] {
+                let mut bytes = vec![b'x'; offset];
+                bytes.extend_from_slice(candidate);
+                bytes.extend_from_slice(b"yyyyyyyyyyyy");
+                assert_eq!(
+                    find_line_boundary(&bytes),
+                    byte_scan_line_boundary(&bytes),
+                    "offset {offset} {candidate:?}"
+                );
+            }
+        }
     }
 
     #[test]
