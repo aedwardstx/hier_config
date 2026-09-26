@@ -52,8 +52,10 @@ data center switches, and route reflectors:
    cores required `multiprocessing`, incurring high memory overhead and
    inter-process serialization costs. The 4.0 Rust core releases the GIL during
    heavy native diffing and parsing, allowing standard Python thread pools
-   (`concurrent.futures.ThreadPoolExecutor`) to saturate all CPU cores with a
-   shared memory footprint.
+   (`concurrent.futures.ThreadPoolExecutor`) to scale across cores with a
+   shared memory footprint: ~3.4x on 8 performance cores today, limited by the
+   work that still holds the GIL (see
+   [Performance Roadmap](performance-roadmap.md#9-release-the-gil-on-the-remaining-core-bound-entry-points)).
 3. **Sub-millisecond rollbacks and simulations**: Complex simulation workflows
    calling `future()` and computing inverse rollbacks frequently duplicate
    trees. `deepcopy` is now ~1,000x faster, and a complete rollback (remediation,

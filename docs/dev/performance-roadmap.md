@@ -94,13 +94,48 @@ It does **not** break attribute reads, `config.dump()`, or `get_hconfig_from_dum
 
 ## 2. Expose a bulk/columnar accessor
 
-**Gain:** workload-dependent; large for analytics-style consumers. Also closes the gap between `iteration`'s measured 0.037 units and the 0.026 that was projected for it.
-**Cost:** none — purely additive, so it can ship in any release, including a patch.
-**Status:** not taken; nothing is blocking it.
+**Gain:** measured on a native prototype. Building `(depth, parent, text)` columns in Rust costs **~10 ns per node**, against ~350–480 ns per node for `dump()` and ~200 ns per node to walk `children` from Python. Returned as Python lists, the accessor is bound by `str` construction (~80 ns per node, the `dump_simple()` cost), so it is **~4–5x faster than `dump()`**. Returned as Arrow buffers to a columnar consumer, no Python object is built per cell: the gain is **~20x against walking `children` and 35–50x against `dump()`**. The same shape applied to a view (an interface table) is **~5x** as lists. It also makes extraction scale across threads, which it does not do today (see below). It also closes the gap between `iteration`'s measured 0.037 units and the 0.026 that was projected for it.
+**Cost:** purely additive for the list form, so it can ship in any release, including a patch. The Arrow form needs a design decision first (see *Phase 2*).
+**Status:** not taken; nothing is blocking the list form.
 
-Reading one attribute from every node costs one Python-level call per node, and every traversal constructs one `HConfigChild` per node whether or not the caller reads anything from it. A method returning parallel lists (or a single list of tuples) for a whole subtree would amortise the boundary crossing across the entire tree instead of paying it per node per attribute — and would skip wrapper construction entirely.
+Reading one attribute from every node costs one Python-level call per node, and every traversal constructs one `HConfigChild` per node whether or not the caller reads anything from it. Consumers such as Nautobot, NetBox, pandas, Polars and DuckDB usually want a flat table across a fleet, for example one interface row per device with `name`, `description`, `ip`, `vlan` and `enabled`. Today they can only get it by building one Python object per node, or per row and attribute.
 
-This is the natural escape hatch for callers who currently write `[c.text for c in config.descendants()]`.
+### Measured extraction paths
+
+The generated Cisco IOS config used below has 400 interfaces (3,206 lines, 2,804 nodes) or 7,000 interfaces (56,006 lines, 49,004 nodes). Each interface has a description, an IPv4 address, an access VLAN and `no shutdown`. Figures are release builds on an Apple M2 Max:
+
+| Path | 400 interfaces | 7,000 interfaces | Per unit |
+|---|---:|---:|---:|
+| View rows: `(name, description, ipv4_interface, enabled, native_vlan)` per `interface_views` entry | 1.31 ms | 23.7 ms | **3.3 µs / row** |
+| `[(line.depth, line.text) for line in config.dump().lines]` | 0.97 ms | 23.5 ms | 350–480 ns / node |
+| Walk `children` two levels, reading `.text` | 0.55 ms | 10.1 ms | ~200 ns / node |
+| `dump_simple()` (one `str` per node, no other objects) | 0.215 ms | 3.97 ms | ~80 ns / node |
+| *Native prototype:* the same five interface columns, Rust only | 0.232 ms | 3.79 ms | 0.54–0.58 µs / row |
+| *Native prototype:* `(depth, parent, text)` buffers, Rust only | 0.026 ms | 0.467 ms | **9.5 ns / node** |
+| *Python floor:* five pre-built columns of 400 / 7,000 items | 0.019 ms | 0.331 ms | ~48 ns / row |
+
+Three conclusions follow:
+
+- **Tree-shaped columns are almost free natively.** 9.5 ns per node is one string copy into a shared byte buffer plus two integer pushes. Everything above that in `dump()` and iteration is the Python object model.
+- **View tables are bound by the attribute logic, not the boundary.** 0.54 µs per interface row natively is five independent child lookups through `MatchRule`, each allocating a `String` (the description) or parsing (the IPv4 address). A columnar entry point can walk each interface's children *once* and fill every requested column in that pass. That should cut the native share well below 0.54 µs per row, but it has not been measured.
+- **Extraction does not scale across threads today.** Extracting `(name, description)` from 32 trees of 7,000 interfaces took 52.9 ms serially and 52.8 ms on an 8-thread `ThreadPoolExecutor`. It is entirely GIL-bound object construction. A columnar accessor gathers into Rust vectors inside `py.detach`, so only the final list conversion holds the GIL. With Arrow output, nothing does.
+
+### Proposal
+
+**Phase 1 — lists, no new dependency.**
+
+- `HConfigBase.to_columns(fields=("depth", "text", "parent")) -> dict[str, list]`. Rows are in `all_children_sorted` order, the order `dump()` already uses. `parent` is the row index of the parent, or `-1` for a top-level line, so the tree can be rebuilt or joined without object identity. Optional fields: `tags`, `comments`, `new_in_config`, `order_weight`. Reject unknown field names, and do not build columns the caller did not ask for.
+- `HConfigView.interface_table(columns=(...)) -> dict[str, list]`, restricted to the scalar interface properties the view already exposes (`name`, `description`, `enabled`, `ipv4_interface`, `native_vlan`, `vrf`, and so on). Validate that every requested column is supported by the platform's view capabilities before walking the tree.
+- Gather inside `py.detach` into Rust `Vec`s, then convert to Python lists with the GIL held. Returning `dict[str, list]` feeds `pandas.DataFrame(...)` and `polars.DataFrame(...)` directly.
+
+**Phase 2 — Arrow, zero Python objects per cell.** Return a small `ColumnBatch` object that implements the [Arrow PyCapsule Interface](https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html) (`__arrow_c_stream__` / `__arrow_c_array__`). Libraries that implement the interface (including recent pyarrow, Polars and DuckDB releases) can then import it without a copy, and hier_config gains no runtime dependency. Strings map to Arrow `utf8` (one offsets buffer plus one byte buffer, exactly the prototype layout above), and integers and booleans to primitive arrays. There are two ways to build it:
+
+- a hand-written exporter for the few types needed (`utf8`, `int32`/`int64`, `bool`, validity bitmaps). It is small, but it is FFI and needs `unsafe`. That code must live in `hier_config_py`, because `hier_config_core` is `#![forbid(unsafe_code)]`.
+- `arrow-array` (or `pyo3-arrow`), which is safe to use but a large compile-time dependency. A new Rust dependency needs an issue first.
+
+Decide between them in an issue once Phase 1 has shipped and a consumer asks for Arrow.
+
+**Parallelism.** Parallelise extraction across *trees*, with Python threads, which the GIL release in Phase 1 makes effective. Do not parallelise within one tree. Splitting one tree's interface rows with `rayon` measured 1.8x at 400 interfaces and 4.7x at 7,000. In a fleet run every core is already busy with other trees, so the per-tree split would only oversubscribe. A multi-tree batch entry point that concatenates tables is also unnecessary: Arrow consumers concatenate cheaply, and a `device` column can be added by the caller.
 
 ### Why this is what remains in `iteration`
 
@@ -302,12 +337,55 @@ The machine has 8 performance cores. By Amdahl's law, the plateau at 8 threads i
 - **Entry points that never release the GIL.** `HConfig.config_to_get_to`/`remediation`, `future`/`future_with_report`, `difference`, `deep_copy`, and text rendering (`__str__`, `lines`) do all their core work while holding it.
 - **Python object construction** for the result `HConfig` and its driver. This part is irreducible.
 
+### Measured ceiling: threads, processes and a native batch
+
+To see how much of the plateau is the GIL, the same fleet job was run under each concurrency model. The job remediates a 400-interface running config (3,206 lines) against an intended config with ~10% of descriptions changed and ~4% of interfaces shut, 256 jobs per run, best of three, release build, Apple M2 Max (8 performance and 4 efficiency cores):
+
+| Model | 1 worker | 8 workers | 12 workers |
+|---|---:|---:|---:|
+| Threads: `from_strings(...).remediation_text()` | 949 / s | 3,233 / s (3.4x) | 3,245 / s |
+| Threads: two `get_hconfig()` calls, `WorkflowRemediation`, `str(remediation_config)` | 889 / s | 2,482 / s (2.8x) | 2,570 / s |
+| `asyncio.to_thread`, text path, 8-thread default executor | 947 / s | 2,763 / s | — |
+| `ProcessPoolExecutor`, text in and text out, `chunksize=8` | 1,076 / s | **7,496 / s (7.0x)** | — |
+| Native Rust with `rayon`, same job, `mimalloc` (the ceiling) | 1,200 / s | **6,693 / s (5.6x)** | 7,339 / s |
+| Native Rust with `rayon`, same job, system allocator | 968 / s | 4,034 / s (4.2x) | 4,917 / s |
+
+What this shows:
+
+- **The thread plateau is the GIL, not the core.** The same job scales to 5.6x on 8 threads natively, and to 7.0x across processes, which each have their own GIL. It is capped at 3.4x only inside one interpreter. A `cProfile` of the text path puts five `model_dump_json` calls per job at ~110 µs of the ~0.88 ms job, all with the GIL held (item 5). A GIL probe measured about 150 µs held per `from_strings` call. That is the serial share Amdahl's law predicts from the plateau.
+- **The allocator matters as much as the lock.** With the system allocator the native ceiling drops from 5.6x to 4.2x. `mimalloc` is already the global allocator in `hier_config_py`; keep it.
+- **The process-wide regex cache is not what caps scaling.** The native batch goes through the same `RwLock`-guarded cache and still reaches 5.6x. Item 5, step 3 still removes that lock from the hot path, but it will not by itself move the thread plateau.
+- **Processes win today, by 2.3x.** Until step 1 and item 5 land, a `ProcessPoolExecutor` that ships *text* in and out is the fastest fleet model. That is a statement about the current GIL-held share, not a design goal; see item 10.
+
 ### Proposal
 
 1. **Wrap the core call of each entry point above in `py.detach`,** following the existing `remediation_config` pattern. Take the `Arc<SharedTree>` clones before detaching, and only touch Python objects after the closure returns. Where one tree is both the source and the delta (the aliasing case in `config_to_get_to`), keep the existing clone-before-lock handling. After item 5 there is less to do here, because rule syncs no longer sit in the middle of these calls.
-2. **Optional: a text-in, text-out entry point**, for example `remediation_text(platform, running, intended) -> str`. It would parse, remediate and render in a single `detach` and create no Python objects at all. It can only honour built-in platform behaviour. Python `post_load_callbacks`, `remediation_transform_callbacks`, workflow plugins and custom drivers cannot run inside it. It must therefore reject a custom driver rather than silently ignore it, and its docs must say which contract it drops. Decide on it once step 1 and item 5 have landed. With those done, the gap between it and `from_strings` may be too small to justify a second API.
+2. **Optional: a text-in, text-out entry point**, for example `remediation_text(platform, running, intended) -> str`. It would parse, remediate and render in a single `detach` and create no Python objects at all. It can only honour built-in platform behaviour. Python `post_load_callbacks`, `remediation_transform_callbacks`, workflow plugins and custom drivers cannot run inside it. It must therefore reject a custom driver rather than silently ignore it, and its docs must say which contract it drops. Decide on it once step 1 and item 5 have landed, using this gate: if 8 threads running `from_strings(...).remediation_text()` then reach at least 80% of the native ceiling above (about 5,400 jobs/s on the reference machine), do not add it.
 
-A native batch API that runs pairs in parallel with `rayon` is **not** proposed. Python threads already reach 3.4x, and the remaining serial share would be the same inside a batch call. The batch API would add a dependency and an API that only duplicates `ThreadPoolExecutor`.
+A native batch API that runs pairs in parallel with `rayon`, such as `remediate_batch(pairs) -> list[str]`, is **not** proposed. The measurements above explain why. A batch call would reach the native ceiling only because it would skip the Python driver and its rule syncs, which is exactly what step 2 does, one pair at a time, under an ordinary `ThreadPoolExecutor`. The remaining differences all favour threads:
+
+- **Throughput.** Equal once the GIL-held share is gone. Both run the same core code on the same cores.
+- **Memory.** A batch call must hold every input and output string until the last pair finishes. A thread pool streams: `executor.map` or `as_completed` can write each result to disk or a database as it arrives.
+- **Ergonomics.** A batch call reports errors per call, not per device, and cannot be cancelled, time-limited or given progress reporting pair by pair. It also brings a second thread pool into the process, which oversubscribes the cores when the caller already runs its own (Celery, Nornir, `asyncio`).
+- **Contract.** It would have to reject custom drivers and callbacks exactly as step 2 does, while adding a `rayon` dependency.
+
+---
+
+## 10. Document the supported concurrency model
+
+**Gain:** none in the library. For users, it prevents the slow patterns in the tables above: up to 2.3x of fleet throughput today, and more for callers who ship `HConfig` objects between processes.
+**Cost:** documentation only.
+**Status:** not taken.
+
+No user-facing page says how to run hier_config across many devices. The only mention is the 3.x-to-4.0 story in [Performance & Benchmarks](benchmarks.md#real-world-operational-impact). Add a short "Concurrency" section to the user guide that records the following, with the measurements from item 9:
+
+- **Threads are the default.** Use `concurrent.futures.ThreadPoolExecutor` and parse inside the worker, preferably with `WorkflowRemediation.from_strings(...)`, which parses both configs in one GIL release. The call releases the GIL for its core work. Say plainly that scaling is ~3.4x on 8 cores until items 5 and 9 land, and update the figure when they do.
+- **`asyncio` applications use `asyncio.to_thread`** (or `loop.run_in_executor`). hier_config does no I/O, so a native `async def` API would only move the same thread hop inside the library. The hop costs ~36 µs per call, about 4% of a 0.9 ms job. Callers with very small configs should hand several devices to one `to_thread` call.
+- **Processes are valid only with text across the boundary.** Send config text in and remediation text out. Never send `HConfig`, `HConfigChild` or `WorkflowRemediation`. They pickle through `dump()`: a 3,206-line `HConfig` takes 3.4 ms to pickle and 3.4 ms to unpickle, and is 342 KiB on the wire, against 0.32 ms to re-parse its 77 KiB of text. That is ~20x the cost of sending the text. Each worker process also costs ~44 MiB resident after importing hier_config and running jobs, against ~16 MiB for a bare interpreter.
+- **Sharing trees between threads.** State what is guaranteed: each tree is guarded by one `RwLock` in `hier_config_py`, so concurrent reads of one tree are safe and a mutation serialises with them. Say that driver rules must not be mutated while another thread uses them, which matches item 5's existing constraint. Pin the read-sharing guarantee with a test under `tests/native/` before documenting it.
+- **Do not add a second pool.** Celery and Nornir workers already run jobs concurrently. Size a thread pool to the cores the worker actually owns.
+
+Keep the thread-pool claim in [Performance & Benchmarks](benchmarks.md#real-world-operational-impact) consistent with the same figures.
 
 ---
 
@@ -325,6 +403,37 @@ A native batch API that runs pairs in parallel with `rayon` is **not** proposed.
 - **One `RegexSet` or Aho-Corasick pass for all rules.** `per_line_sub` already goes through a `RegexSet` prefilter (`PreparedSubs`). The lineage-rule lists are short: the IOS driver has 8 idempotency, 5 ordering and 3 sectional-exit rules, and most are `startswith` checks that cost nanoseconds. Pre-resolving the regexes (item 5, step 3) removes the real overhead, which is the cache lookup, not the matching.
 - **Free-threaded CPython builds.** Wheels are built for `abi3-py311`, and the stable ABI does not cover free-threaded interpreters, so this would need a separate wheel matrix. It would also require auditing the Python driver layer. After item 9 the GIL is held for little beyond object construction, so the gain does not justify that yet.
 - **Zero-copy `&str` spans into the source text.** A mutable tree outlives its source string, and nodes are added, edited and copied after parsing, so a borrowed span cannot represent node text. The owned-buffer version is item 3.
+
+- **Parallelism inside one tree, and a native `rayon` batch API.** See [Concurrency patterns that do not pay](#concurrency-patterns-that-do-not-pay) below and item 9.
+- **Native `async def` bindings, and `pickle`-based multiprocessing of trees.** See the same section.
+
+### Concurrency patterns that do not pay
+
+These were measured with a throwaway Rust harness linked against `hier_config_core`, with `rayon` and the release profile, on the same generated IOS configs as item 2. The harness lived outside the repository and has been deleted.
+
+**Parsing one config on several threads.** The prototype split the text at top-level boundaries into *k* chunks and parsed them with `rayon`:
+
+| Lines | Serial parse | *k* = 4, chunks only | *k* = 4, then merged into one tree |
+|---:|---:|---:|---:|
+| 3,206 | 0.36 ms | 0.26 ms | 0.71 ms |
+| 8,006 | 0.79 ms | 0.44 ms | 1.58 ms |
+| 56,006 | 5.50 ms | 2.96 ms | 11.96 ms |
+
+Even the unmerged chunks scale only ~1.9x at 4 threads, and 8 chunks are no faster than 4: parsing is bound by allocation and memory traffic, not arithmetic. Merging through `Tree::merge` deep-copies every node, and costs more than the whole serial parse. A usable version would need arena splicing with `NodeId` rebasing. It would also have to merge duplicate top-level sections that straddle a chunk boundary and run post-load callbacks over the whole tree afterwards. The split itself must also respect banners, multi-line blocks and platform preprocessors. The best case is ~2.5 ms saved on a 56k-line config, and nothing in a fleet run, where every core is already parsing another device. Rejected.
+
+**Remediating one pair on several threads.** Remediating *k* = 4 pre-partitioned chunk pairs in parallel, without merging the results and ignoring every rule that crosses a chunk, measured:
+
+| Lines | Serial | *k* = 4 (idealised) | Speed-up |
+|---:|---:|---:|---:|
+| 3,206 | 0.237 ms | 0.150 ms | 1.6x |
+| 8,006 | 0.510 ms | 0.231 ms | 2.2x |
+| 56,006 | 3.79 ms | 1.23 ms | 3.1x |
+
+These are upper bounds. Top-level siblings interact: an idempotency rule lets `hostname NEW` replace `hostname OLD` without a negation, because `idempotent_for` compares a line against its siblings. Sectional overwrite and order weights also cross partitions. Only *matched top-level sections*, whose subtrees are independent, could safely run in parallel. Dispatch also costs something at this scale. A `rayon::join` issued from a thread outside the pool, which is what a Python thread calling into the extension would be, measured ~16 µs per call while the pool wakes up, against ~12 ns inside a warm pool. So work below ~50–100 µs loses outright. The crossover is therefore around 10–20k lines for single-device latency, and never for fleet throughput. Revisit only if a concrete single-device latency requirement appears (for example an interactive tool on 50k-line configs), and then as an opt-in that parallelises matched top-level sections only.
+
+**Native `async def` bindings or async generators.** hier_config does no I/O; every operation is CPU-bound. An `async def` binding would still have to run the work on a thread to avoid blocking the event loop, which is what `asyncio.to_thread` already does. Measured: 2,763 jobs/s on an 8-thread default executor, with ~36 µs of overhead per call. Streaming results through an async generator does not help either: remediation is computed for the whole tree before any line of it is known to be final (ordering weights and sectional exits are applied at the end), and the output is small. Document `asyncio.to_thread` instead (item 10).
+
+**Multiprocessing with trees as the payload, and shared memory.** In 3.x, the pure-Python engine held the GIL for all of its work, so processes were the only way to use more than one core. They remain valid in 4.0, and are currently faster than threads (item 9), but only with *text* as the payload. Pickling an `HConfig` goes through `dump()` and costs ~20x a re-parse (item 10). Shared memory does not remove that cost. The arena holds heap-allocated `String`s, child vectors and hash indexes, none of which is position-independent. Sharing a tree would mean a flat serialised form that the reader has to rebuild into an arena, which costs about as much as parsing the text. Text is already the compact, position-independent form. Putting the *input text* in `multiprocessing.shared_memory` would save one copy of ~77 KiB per job, which is noise against a 0.9 ms job. Rejected.
 
 ### Already in place
 
@@ -354,6 +463,6 @@ Several of these suggestions come up repeatedly, so this list records that they 
 
 Taking items 1 and 2 would land `iteration` at ~0.026 units and `dump` at ~0.15. Items 3 and 4 only move `parse`: together they are unlikely to take more than 1–1.5 ms off the 50k-line benchmark's ~5.0 ms core time.
 
-Items 5–8 are internal and compatible with each other. Their measured gains overlap: PGO speeds up code that items 5 and 6 would delete, and removing rule syncs makes hashing a larger share of what remains. **Estimate**, not a measurement: taken together, they are likely to take 25–40% off `remediation` and `deepcopy`, 20–30% off `parse`, and a similar share off end-to-end workflow time. Measure after each item rather than assuming the sum. Item 9 does not change single-call latency, but it should move 8-thread throughput beyond the current 3.4x.
+Items 5–8 are internal and compatible with each other. Their measured gains overlap: PGO speeds up code that items 5 and 6 would delete, and removing rule syncs makes hashing a larger share of what remains. **Estimate**, not a measurement: taken together, they are likely to take 25–40% off `remediation` and `deepcopy`, 20–30% off `parse`, and a similar share off end-to-end workflow time. Measure after each item rather than assuming the sum. Item 9 does not change single-call latency, but together with item 5 it should move 8-thread throughput from the current 3.4x towards the 5.6x native ceiling measured for the same job. Item 2 is the one large gain available to extraction workloads: ~4–5x over `dump()` as lists, and far more as Arrow.
 
 A blanket "2x across the board" is **not** achievable while the current API holds — that is a measured result, not a prediction. The work already done cleared 1.35–1.86x on the Rust-bound operations and 2.6x on `iteration`, and moved `dump` almost not at all. The large remaining gains are concentrated in exactly two operations, and both are paid for in compatibility or in new API surface. The other operations have smaller headroom that needs no API change (items 3–8).
