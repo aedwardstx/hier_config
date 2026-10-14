@@ -251,6 +251,58 @@ fn copies_preserve_only_documented_metadata_and_merge_instances() {
 }
 
 #[test]
+fn deep_copy_with_reports_copied_pairs_in_preorder_even_on_failure() {
+    let mut src = Tree::default();
+    let root = src.root;
+    let parent = add(&mut src, root, "parent");
+    let first = add(&mut src, parent, "first");
+    let nested = add(&mut src, first, "nested");
+    let second = add(&mut src, parent, "second");
+    let mut dst = Tree::default();
+    let mut pairs = Vec::new();
+    let copy = dst
+        .add_deep_copy_of_with(dst.root, &src, parent, true, &mut |new, old| {
+            pairs.push((new, old));
+        })
+        .unwrap();
+    let copied = |tree: &Tree, path: &[&str]| {
+        path.iter().fold(copy, |node, text| {
+            if *text == "parent" {
+                node
+            } else {
+                tree.get_child_by_text(node, text).unwrap()
+            }
+        })
+    };
+    assert_eq!(
+        pairs,
+        [
+            (copy, parent),
+            (copied(&dst, &["first"]), first),
+            (copied(&dst, &["first", "nested"]), nested),
+            (copied(&dst, &["second"]), second),
+        ]
+    );
+
+    let duplicated = add(&mut src, root, "duplicated");
+    let kept = add(&mut src, duplicated, "same");
+    src.add_child(duplicated, "same", false, false).unwrap();
+    let mut partial = Vec::new();
+    let result = dst.add_deep_copy_of_with(dst.root, &src, duplicated, false, &mut |new, old| {
+        partial.push((new, old));
+    });
+    assert!(matches!(result, Err(TreeError::DuplicateChild(_))));
+    let copied_parent = dst.get_child_by_text(dst.root, "duplicated").unwrap();
+    assert_eq!(
+        partial,
+        [
+            (copied_parent, duplicated),
+            (dst.get_child_by_text(copied_parent, "same").unwrap(), kept),
+        ]
+    );
+}
+
+#[test]
 fn shallow_copy_within_preserves_metadata_and_merges_into_existing_copy() {
     let mut src = Tree::default();
     let root = src.root;

@@ -240,6 +240,12 @@ v4 design decisions, for the record:
   prefilter rejects returns "no match" instead of a backtrack-limit error.
   Measurements are in `docs/dev/benchmarks.md` (Pass 6). (#TBD)
 
+- `HConfig.merge()` and `add_deep_copy_of()` copy subtrees from another tree in
+  one native pass instead of recursing through Python per node; merging a
+  10k-line IOS config is about 50% faster. Results, comments, tags and the
+  `Instance` records appended to `instances` are unchanged, and `HConfig`
+  subclasses that override `add_deep_copy_of` still have it called. (#TBD)
+
 - `HConfigChild.comments` is now a live view over the node's comments rather
   than a detached copy. Mutating the returned object — `child.comments.add(…)`
   — now updates the configuration, where previously the change was silently

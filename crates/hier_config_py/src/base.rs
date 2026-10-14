@@ -127,6 +127,64 @@ impl PyHConfigBase {
         Ok(())
     }
 
+    /// Deep-copies `source_id` from a *different* tree under this node in one
+    /// native pass, then appends the Python `Instance` records that the
+    /// per-node Python path appends for a merge.
+    ///
+    /// Each record mirrors `HConfigChild.instance` on the source node: the id
+    /// of the source tree's `HConfig`, plus the node's comments and tags, which
+    /// the native copy already captured in its own instance. Python is only
+    /// called once both tree locks are released.
+    pub(crate) fn add_deep_copy_from(
+        &self,
+        py: Python<'_>,
+        source_tree: &Arc<SharedTree>,
+        source_id: NodeId,
+        merged: bool,
+    ) -> PyResult<NodeId> {
+        let mut copied: Vec<NodeId> = Vec::new();
+        let (result, records) = {
+            let mut tree = self.write_tree()?;
+            let source = source_tree.read_node(source_id)?;
+            let result = tree.add_deep_copy_of_with(
+                self.node_id,
+                &source,
+                source_id,
+                merged,
+                &mut |new, _| {
+                    if merged {
+                        copied.push(new);
+                    }
+                },
+            );
+            let records: Vec<(NodeId, Instance)> = copied
+                .iter()
+                .filter_map(|&id| {
+                    let instance = tree.arena.get(id)?.instances().last()?;
+                    Some((id, instance.clone()))
+                })
+                .collect();
+            (result, records)
+        };
+        if !records.is_empty() {
+            let root = crate::child::PyHConfigChild::root_object(py, source_tree)?;
+            let root_id = root.bind(py).as_ptr() as usize;
+            let instance_cls = py.import("hier_config.models")?.getattr("Instance")?;
+            for (node_id, instance) in records {
+                let kwargs = PyDict::new(py);
+                kwargs.set_item("id", root_id)?;
+                kwargs.set_item("comments", PyFrozenSet::new(py, &instance.comments)?)?;
+                kwargs.set_item("tags", PyFrozenSet::new(py, &instance.tags)?)?;
+                let record = instance_cls.call((), Some(&kwargs))?;
+                self.tree
+                    .get_node_instances(py, node_id)?
+                    .bind(py)
+                    .append(record)?;
+            }
+        }
+        result.map_err(to_py_err)
+    }
+
     pub fn text(&self) -> PyResult<String> {
         let tree = self.read_tree()?;
         Ok(tree
@@ -360,6 +418,20 @@ impl PyHConfigBase {
         >,
         #[gen_stub(override_type(type_repr="bool", imports=()))] merged: bool,
     ) -> PyResult<Py<PyAny>> {
+        // Copies from another tree run natively: a stock `HConfigChild` source
+        // exposes nothing overridable, and every handle the recursion would
+        // dispatch to is a natively created, exact `HConfigChild`.
+        if child_to_add.is_exact_instance_of::<crate::child::PyHConfigChild>() {
+            let source = child_to_add.cast::<Self>()?.borrow();
+            if !Arc::ptr_eq(&self.tree, &source.tree) {
+                let (source_tree, source_id) = (Arc::clone(&source.tree), source.node_id);
+                drop(source);
+                let new_id = self.add_deep_copy_from(py, &source_tree, source_id, merged)?;
+                return Ok(
+                    SharedTree::get_or_create_child(&self.tree, py, new_id, None)?.into_any(),
+                );
+            }
+        }
         let new_child = self.add_shallow_copy_of(py, child_to_add, merged)?;
         let new_child_bound = new_child.bind(py);
         let children = child_to_add.getattr("children")?;

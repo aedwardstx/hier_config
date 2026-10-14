@@ -371,8 +371,30 @@ impl PyHConfig {
         let py = slf.py();
         let slf_obj = slf.into_py_any(py)?;
         let slf_bound = slf_obj.bind(py);
+        // A stock `HConfig` has no `add_deep_copy_of` override to honour, so a
+        // stock source from another tree is merged natively, child by child.
+        let native_target = slf_bound
+            .cast_exact::<Self>()
+            .ok()
+            .map(|target| Arc::clone(&target.as_super().borrow().tree));
 
         let merge_single = |other_obj: &Bound<'_, PyAny>| -> PyResult<()> {
+            if let Some(target_tree) = &native_target
+                && let Ok(source) = other_obj.cast_exact::<Self>()
+            {
+                let source_tree = Arc::clone(&source.as_super().borrow().tree);
+                if !Arc::ptr_eq(target_tree, &source_tree) {
+                    let target = slf_bound.cast::<PyHConfigBase>()?.borrow();
+                    let child_ids: Vec<_> = {
+                        let tree = source_tree.tree.read_py()?;
+                        tree.arena[tree.root].children.iter().collect()
+                    };
+                    for child_id in child_ids {
+                        target.add_deep_copy_from(py, &source_tree, child_id, true)?;
+                    }
+                    return Ok(());
+                }
+            }
             let children = other_obj.getattr("children")?;
             for child in children.try_iter()? {
                 let child_item = child?;

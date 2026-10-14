@@ -539,9 +539,30 @@ impl Tree {
         source_id: NodeId,
         merged: bool,
     ) -> Result<NodeId, TreeError> {
+        self.add_deep_copy_of_with(parent_id, source_tree, source_id, merged, &mut |_, _| {})
+    }
+
+    /// [`Tree::add_deep_copy_of`] that reports every copied node as
+    /// `(new_id, source_id)` in preorder, immediately after it is copied.
+    ///
+    /// Nodes copied before an error are still reported, so callers can keep
+    /// side tables in step with a partially completed copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TreeError`] under the same conditions as [`Tree::add_deep_copy_of`].
+    pub fn add_deep_copy_of_with(
+        &mut self,
+        parent_id: NodeId,
+        source_tree: &Self,
+        source_id: NodeId,
+        merged: bool,
+        on_copy: &mut impl FnMut(NodeId, NodeId),
+    ) -> Result<NodeId, TreeError> {
         let new_child = self.add_shallow_copy_of(parent_id, source_tree, source_id, merged)?;
+        on_copy(new_child, source_id);
         for child_id in source_tree.arena[source_id].children.iter() {
-            self.add_deep_copy_of(new_child, source_tree, child_id, merged)?;
+            self.add_deep_copy_of_with(new_child, source_tree, child_id, merged, on_copy)?;
         }
         Ok(new_child)
     }
