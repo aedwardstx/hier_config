@@ -230,6 +230,16 @@ v4 design decisions, for the record:
 
 ### Changed
 
+- Rust core performance pass, with no public API change. Remediation and
+  rollback no longer rescan a section to drop temporary children: 75–88% faster
+  on wide sections. Rule regexes that need backtracking (lookaround, atomic
+  groups, `\b`) are guarded by a linear prefilter: IOS-XR parsing is 68% faster.
+  `splitlines` scans a word at a time, each new child's text is hashed once, and
+  small sections index their children without hashing: IOS parsing is 31–38%
+  faster and future projection 42% faster. One behaviour change: a line that the
+  prefilter rejects returns "no match" instead of a backtrack-limit error.
+  Measurements are in `docs/dev/benchmarks.md` (Pass 6). (#TBD)
+
 - `HConfigChild.comments` is now a live view over the node's comments rather
   than a detached copy. Mutating the returned object — `child.comments.add(…)`
   — now updates the configuration, where previously the change was silently

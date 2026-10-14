@@ -15,16 +15,16 @@ Reference figures on an Apple M2 Max, release build (`maturin develop --release`
 
 | Operation | Cost (units) | Wall clock | Gate ceiling | Remaining headroom |
 |---|---:|---:|---:|---|
-| `deepcopy` | 0.020 | 0.06 ms | 0.03 | None — Rust-bound |
-| `iteration` | 0.037 | 0.11 ms | 0.06 | ~0.011 units, via [item 2](#2-expose-a-bulkcolumnar-accessor) |
-| `remediation` | 0.123 | 0.37 ms | 0.19 | None — Rust-bound |
-| `fast_load` | 0.162 | 0.48 ms | 0.24 | None — Rust-bound |
-| `parse` | 0.184 | 0.55 ms | 0.27 | None — Rust-bound |
-| `dump` | 0.266 | 0.80 ms | 0.37 | ~45%, via [item 1](#1-change-dumpline-from-a-pydantic-model-to-a-__slots__-class) |
+| `deepcopy` | 0.015 | 0.05 ms | 0.03 | Little — mostly index clones and drops |
+| `iteration` | 0.049 | 0.15 ms | 0.06 | ~0.011 units, via [item 2](#2-expose-a-bulkcolumnar-accessor) |
+| `remediation` | 0.124 | 0.38 ms | 0.19 | Small on this workload; see below |
+| `fast_load` | 0.203 | 0.62 ms | 0.24 | Rust-bound; see below |
+| `parse` | 0.162 | 0.49 ms | 0.24 | Rust-bound; see below |
+| `dump` | 0.308 | 0.94 ms | 0.45 | ~45%, via [item 1](#1-change-dumpline-from-a-pydantic-model-to-a-__slots__-class) |
 
 Re-derive these with `pytest -m benchmark tests/benchmarks/test_perf_regression.py -v -s` rather than trusting any number written down here.
 
-**Only two operations have headroom left, and both are gated on the object model.** `parse`, `fast_load`, `deepcopy`, and `remediation` are Rust-bound and their compatible headroom has been collected; the split below is why.
+**The two CPython-bound operations are gated on the object model.** `parse`, `fast_load`, `deepcopy`, and `remediation` are Rust-bound. An earlier version of this page said their headroom had been collected. [Pass 6](benchmarks.md#pass-6-rust-hot-path-profiling-against-the-comparison-workloads) then cut parse time by 31–38% and remediation time on wide sections by 75–88% without any API change, so treat "Rust-bound" as "needs a profile", not "finished". Remaining Rust hot spots in parse are line normalisation, `SipHash` on wide sections, and the per-line rule `RegexSet` prefilter with its substitutions.
 
 ### Why the rest is finished
 
@@ -112,7 +112,7 @@ What is left is the `Py::new` per node itself. That is only avoidable by not con
 ## What is not worth attempting
 
 - **More Rust-side work on `dump`.** It is at ~246 ns/line against a ~250 ns CPython floor. Item 1 or nothing.
-- **More work on `remediation`, `parse`, `fast_load`, or `deepcopy`.** All Rust-bound with the compatible headroom already collected. Confirm against a native harness before assuming otherwise.
+- **Rust-side work on `iteration` or `all_children_sorted`.** Pass 6 profiles show that both are dominated by CPython allocation, like `dump`.
 - **Dropping node interning wholesale** rather than the current conservative split. The extra gain over keeping single-node identity is small, and it breaks the one identity case the suite pins. See [Architecture](architecture.md#core-tree-model).
 - **Removing `Dump` / `DumpLine` from the public surface.** Serialising a config is a legitimate documented use case; changing the class shape is justified, deleting the API is not.
 
@@ -130,6 +130,6 @@ What is left is the `Py::new` per node itself. That is only avoidable by not con
 
 ## Realistic ceiling
 
-Taking both items would land `iteration` at ~0.026 units and `dump` at ~0.15. Nothing else moves.
+Taking both items would land `iteration` at ~0.026 units and `dump` at ~0.15. Neither affects the Rust-bound operations.
 
-A blanket "2x across the board" is **not** achievable while the current API holds — that is a measured result, not a prediction. The work already done cleared 1.35–1.86x on the Rust-bound operations and 2.6x on `iteration`, and moved `dump` almost not at all. The remaining gains are concentrated in exactly two operations, and both are paid for in compatibility or in new API surface.
+A blanket "2x across the board" is **not** achievable while the current API holds. That is a measured result, not a prediction. Pass 6 cleared 2x on XR parsing, remediation, and rollback. It reached 1.4–1.7x on IOS parsing and future projection and 1.1x on `deepcopy`, and moved `dump` and `all_children_sorted` not at all. The remaining CPython-bound gains are concentrated in `dump` and `iteration`, and both are paid for in compatibility or in new API surface.

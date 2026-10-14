@@ -52,7 +52,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 # incorrectly described uniform 1.5x/1.75x headroom. No such margin is assumed.
 # CI calibration requires measurements on the release build and runner in use.
 MAX_COST_UNITS = {
-    "parse": 0.27,
+    "parse": 0.24,
     "fast_load": 0.24,
     "deepcopy": 0.03,
     "dump": 0.45,

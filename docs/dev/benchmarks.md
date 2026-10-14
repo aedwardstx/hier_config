@@ -274,7 +274,7 @@ allocation floor**.
 ## Iterative Optimization Passes
 
 The headline numbers were not achieved in a single pass. Achieving them required
-systematic profiling and tuning across five distinct phases:
+systematic profiling and tuning across six distinct phases:
 
 ### Pass 1: The Initial Rust Core & Binding
 The initial migration implemented the arena allocator, regex matching, and
@@ -323,6 +323,72 @@ a blanket API return-type promise; consult the
 [migration reference](../user/rust-core-changes.md#traversal-return-types)
 and current stubs for the supported iterator/collection contracts.
 
+### Pass 6: Rust Hot-Path Profiling Against the Comparison Workloads
+A later pass profiled every workload in this document with macOS `sample`
+against a release build and changed only the Rust core. Each change came with
+a test and was kept only if it showed a measured gain:
+
+- **O(1) scratch-child removal in remediation.** `compute_right` and the
+  diff walk built a temporary child and then deleted it with an O(n) scan of the
+  parent's children, which made remediation quadratic in wide sections. The
+  core now pops a trailing child directly and falls back to the general delete
+  otherwise. Shallow copies also skip the ancestor tag walk unless its result is
+  used.
+- **Linear prefilter for lookaround rules.** Rule regexes that need
+  `fancy-regex` (lookaround, atomic groups, `\b`) now get a linear `regex`
+  prefilter derived from the same pattern, with lookarounds and word-boundary
+  assertions relaxed to empty. The prefilter is never stricter than the full
+  pattern. Lines it rejects skip the backtracking engine entirely; patterns
+  with backreferences, conditionals or `\G` keep the old path.
+- **Word-at-a-time `splitlines`.** The parser jumps over 8-byte words of
+  printable ASCII and only decodes the bytes that can start a Python line
+  boundary (control bytes, NEL, LS, PS). It sizes the arena from a newline count
+  instead of a second split pass. A property test pins the result to Python's
+  `str.splitlines` on arbitrary Unicode.
+- **One hash per checked child.** `add_child` resolves the duplicate check and
+  the index insert with a single entry lookup.
+- **Small-section child index.** Sections with up to eight distinct child texts
+  are indexed by a short vector rather than a `SipHash` map, which avoids
+  hashing every line of a typical interface stanza. Larger sections switch to
+  the randomly seeded map, so hash-flooding resistance is unchanged. Equality
+  and the serde form of `Children` do not depend on the representation.
+
+Before/after on the workloads of this document: Apple M2 Max, CPython 3.14.4,
+rustc 1.98.1, `maturin develop --release`. The baseline was the release
+extension built from the parent commit (`e86911d`); "after" is this pass. Each
+build ran alternately in fresh processes, 3 rounds × 25 samples; the table shows
+the median of the per-round medians. A baseline-vs-baseline run measured
+roughly ±3% noise.
+
+| Operation | Before | After | Time reduction | 50% goal |
+|---|---:|---:|---:|---|
+| Parse IOS, 1k lines | 0.300 ms | 0.207 ms | 31% | not met |
+| Parse IOS, 10k lines | 2.036 ms | 1.296 ms | 36% | not met |
+| Parse IOS, 50k lines | 9.654 ms | 6.000 ms | 38% | not met |
+| Parse IOS-XR, 10k lines | 7.127 ms | 2.295 ms | 68% | met |
+| Parse non-ASCII IOS, 10k lines | 2.181 ms | 1.414 ms | 35% | not met |
+| `deepcopy` (10k) | 0.142 ms | 0.124 ms | 12% | not met |
+| Remediation (10k) | 3.742 ms | 0.934 ms | 75% | met |
+| Remediation (50k) | 33.604 ms | 4.162 ms | 88% | met |
+| Remediation, non-ASCII (10k) | 3.810 ms | 0.950 ms | 75% | met |
+| Future projection (1k interfaces) | 1.238 ms | 0.723 ms | 42% | not met |
+| Rollback (1k interfaces) | 3.149 ms | 0.823 ms | 74% | met |
+| `all_children_sorted` (10k) | 0.419 ms | 0.414 ms | 1% | not met |
+| `dump()` (10k) | 3.395 ms | 3.428 ms | −1% (noise) | not met |
+
+Caveats:
+
+- These absolute figures come from one machine and differ from the historical
+  tables above. Compare the ratios, not the milliseconds.
+- `all_children_sorted` and `dump()` did not move. Profiles show that both are
+  dominated by CPython object allocation; see
+  [The CPython Allocation Boundary](#the-cpython-allocation-boundary).
+- The remediation gains depend on section width. The 400-interface CI gate
+  workload improved by 26% rather than 75%, because its sections are smaller.
+- For a rule regex that needs backtracking, a line the prefilter rejects now
+  returns "no match" directly. Before this change, such a line could fail with
+  the backtracking engine's limit error.
+
 ---
 
 ## Performance Guardrails in CI
@@ -366,17 +432,17 @@ claiming cross-platform calibration.
 ### Enforced CI Ceilings
 
 The CI regression suite asserts upper bounds (`MAX_COST_UNITS`) against
-a 400-interface configuration. The following recorded local measurements
-explain the original budgets; current code and CI logs are authoritative:
+a 400-interface configuration. The following figures were last recorded
+locally after Pass 6; current code and CI logs are authoritative:
 
 | Operation | Observed 4.0 Cost | CI Ceiling (`MAX_COST_UNITS`) | Safety Margin |
 |---|---:|---:|---|
-| **`deepcopy`** | **0.020 units** (0.06 ms) | 0.030 units | 1.5x |
-| **`iteration`** | **0.037 units** (0.11 ms) | 0.060 units | 1.6x |
-| **`remediation`** | **0.123 units** (0.37 ms) | 0.190 units | 1.5x |
-| **`fast_load`** | **0.162 units** (0.48 ms) | 0.240 units | 1.5x |
-| **`parse`** | **0.184 units** (0.55 ms) | 0.270 units | 1.5x |
-| **`dump`** | **0.266 units** (0.80 ms) | 0.370 units | 1.4x |
+| **`deepcopy`** | **0.015 units** (0.05 ms) | 0.030 units | 2.0x |
+| **`iteration`** | **0.049 units** (0.15 ms) | 0.060 units | 1.2x |
+| **`remediation`** | **0.124 units** (0.38 ms) | 0.190 units | 1.5x |
+| **`fast_load`** | **0.203 units** (0.62 ms) | 0.240 units | 1.2x |
+| **`parse`** | **0.162 units** (0.49 ms) | 0.240 units | 1.5x |
+| **`dump`** | **0.308 units** (0.94 ms) | 0.450 units | 1.5x |
 
 The gate detects costs exceeding those budgets. It does not guarantee that
 every regression will be detected or attribute a failure to code rather than
