@@ -93,6 +93,14 @@ pub fn rule_regex(pattern: &str) -> Result<Arc<regex::Regex>, String> {
 pub enum MatchRegex {
     Linear(Arc<regex::Regex>),
     Backtracking(Arc<fancy_regex::Regex>),
+    /// A backtracking pattern guarded by a linear-time necessary condition.
+    ///
+    /// `prefilter` accepts a superset of what `full` matches, so a line it rejects
+    /// is a definite non-match and the backtracking engine never runs for it.
+    Prefiltered {
+        prefilter: Arc<regex::Regex>,
+        full: Arc<fancy_regex::Regex>,
+    },
 }
 
 impl MatchRegex {
@@ -100,23 +108,99 @@ impl MatchRegex {
     ///
     /// Rejects patterns unsupported by either engine.
     pub fn cached(pattern: &str) -> Result<Self, String> {
-        regex(pattern)
-            .map(Self::Linear)
-            .or_else(|| fancy(pattern).map(Self::Backtracking))
-            .ok_or_else(|| format!("invalid or unsupported regex {pattern:?}"))
+        if let Some(re) = regex(pattern) {
+            return Ok(Self::Linear(re));
+        }
+        let full =
+            fancy(pattern).ok_or_else(|| format!("invalid or unsupported regex {pattern:?}"))?;
+        Ok(match prefilter(pattern) {
+            Some(prefilter) => Self::Prefiltered { prefilter, full },
+            None => Self::Backtracking(full),
+        })
     }
 
     /// # Errors
     ///
     /// Reports bounded-backtracking failures instead of treating them as nonmatches.
     pub fn is_match(&self, text: &str) -> Result<bool, String> {
-        match self {
-            Self::Linear(re) => Ok(re.is_match(text)),
-            Self::Backtracking(re) => re
-                .is_match(text)
-                .map_err(|error| format!("regex evaluation failed for {:?}: {error}", re.as_str())),
-        }
+        let full = match self {
+            Self::Linear(re) => return Ok(re.is_match(text)),
+            Self::Prefiltered { prefilter, .. } if !prefilter.is_match(text) => {
+                return Ok(false);
+            }
+            Self::Backtracking(full) | Self::Prefiltered { full, .. } => full,
+        };
+        full.is_match(text)
+            .map_err(|error| format!("regex evaluation failed for {:?}: {error}", full.as_str()))
     }
+}
+
+/// Returns the cached linear prefilter for a backtracking-only `pattern`.
+fn prefilter(pattern: &str) -> Option<Arc<regex::Regex>> {
+    static CACHE: OnceLock<Cache<regex::Regex>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+    lookup(cache, pattern, linear_prefilter)
+}
+
+/// Derives a linear-time regex that matches every string `pattern` matches.
+///
+/// Zero-width assertions the linear engine lacks (lookaround, `\K`, and
+/// fancy-regex's word-boundary forms) are replaced with the empty expression and
+/// atomic groups are unwrapped. Each change can only widen the language, so the
+/// result is a necessary condition for a match. Patterns whose meaning depends on
+/// captured text (backreferences, conditionals) or on the previous match (`\G`)
+/// have no such relaxation, and a relaxation that matches everything is useless;
+/// both yield `None`.
+fn linear_prefilter(pattern: &str) -> Option<regex::Regex> {
+    let tree = fancy_regex::Expr::parse_tree(&translate_python_syntax(pattern)).ok()?;
+    let relaxed = relax(tree.expr)?;
+    let mut source = String::new();
+    relaxed.to_str(&mut source, 0);
+    if source.is_empty() {
+        return None;
+    }
+    regex::Regex::new(&source).ok()
+}
+
+fn relax(expr: fancy_regex::Expr) -> Option<fancy_regex::Expr> {
+    use fancy_regex::{Assertion, Expr};
+
+    let relax_all =
+        |children: Vec<Expr>| -> Option<Vec<Expr>> { children.into_iter().map(relax).collect() };
+    Some(match expr {
+        Expr::LookAround(..)
+        | Expr::KeepOut
+        | Expr::Assertion(
+            Assertion::LeftWordBoundary
+            | Assertion::RightWordBoundary
+            | Assertion::WordBoundary
+            | Assertion::NotWordBoundary,
+        ) => Expr::Empty,
+        Expr::AtomicGroup(child) => relax(*child)?,
+        Expr::Group(child) => Expr::Group(Box::new(relax(*child)?)),
+        Expr::Concat(children) => Expr::Concat(relax_all(children)?),
+        Expr::Alt(children) => Expr::Alt(relax_all(children)?),
+        Expr::Repeat {
+            child,
+            lo,
+            hi,
+            greedy,
+        } => Expr::Repeat {
+            child: Box::new(relax(*child)?),
+            lo,
+            hi,
+            greedy,
+        },
+        Expr::Backref(_)
+        | Expr::BackrefExistsCondition(_)
+        | Expr::Conditional { .. }
+        | Expr::ContinueFromPreviousMatchEnd => return None,
+        easy @ (Expr::Empty
+        | Expr::Any { .. }
+        | Expr::Assertion(_)
+        | Expr::Literal { .. }
+        | Expr::Delegate { .. }) => easy,
+    })
 }
 
 /// Converts a Python `re.sub` replacement to the Rust engine's template syntax.
@@ -322,6 +406,89 @@ mod tests {
         let re = fancy(r"^foo(?!bar)").expect("valid pattern");
         assert!(re.is_match("foobaz").unwrap_or(false));
         assert!(!re.is_match("foobar").unwrap_or(true));
+    }
+
+    const XR_TEMPLATE: &str = r"^\s*template(?!\s+(?:data\s+|options\s+)?timeout)";
+
+    #[test]
+    fn lookaround_patterns_gain_a_linear_prefilter() {
+        let MatchRegex::Prefiltered { prefilter, .. } =
+            MatchRegex::cached(XR_TEMPLATE).expect("valid pattern")
+        else {
+            panic!("lookaround pattern should be prefiltered");
+        };
+        // The prefilter drops the lookahead, so it accepts a superset.
+        assert!(prefilter.is_match("template timeout"));
+        assert!(!prefilter.is_match("interface Gi0/0"));
+    }
+
+    #[test]
+    fn prefilter_is_skipped_for_patterns_it_cannot_relax() {
+        for pattern in [
+            r"(a)\1",
+            r"(?<x>a)\k<x>",
+            r"(a)?(?(1)b|c)",
+            r"\Ga",
+            r"(?!x)",
+        ] {
+            assert!(
+                matches!(MatchRegex::cached(pattern), Ok(MatchRegex::Backtracking(_))),
+                "{pattern}"
+            );
+        }
+        assert!(linear_prefilter("(unclosed").is_none());
+    }
+
+    #[test]
+    fn prefiltered_matching_agrees_with_backtracking() {
+        let patterns = [
+            XR_TEMPLATE,
+            r"^foo(?!bar)",
+            r"(?<=ab)c",
+            r"(?i)^IP(?= )",
+            r"\bvlan\b(?!\s+\d)",
+            r"(?>a+)b",
+            r"x\Kz",
+            r"(?m)^end(?=$)",
+            r"^\s+(?!no\s)\S+\Z",
+        ];
+        let lines = [
+            "",
+            "template foo",
+            "  template data timeout",
+            "template options timeout 5",
+            "template timeout",
+            "templates",
+            "foobaz",
+            "foobar",
+            "abc",
+            "xabc",
+            "ip address",
+            "IP route",
+            "vlan 10",
+            "vlan name",
+            "aaab",
+            "xz",
+            "end",
+            " no shutdown",
+            " shutdown",
+            "设备 template é",
+        ];
+        for pattern in patterns {
+            let full = fancy(pattern).expect("valid pattern");
+            let matcher = MatchRegex::cached(pattern).expect("valid pattern");
+            assert!(
+                matches!(matcher, MatchRegex::Prefiltered { .. }),
+                "{pattern}"
+            );
+            for line in lines {
+                assert_eq!(
+                    matcher.is_match(line),
+                    Ok(full.is_match(line).unwrap()),
+                    "{pattern} on {line:?}"
+                );
+            }
+        }
     }
 
     #[test]
