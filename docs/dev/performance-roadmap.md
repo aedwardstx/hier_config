@@ -5,24 +5,24 @@ The Rust rewrite retains the main tree/driver/workflow API but includes explicit
 the profiled release build, not a proof that every future optimization requires
 an API break. Some measured hot paths are dominated by CPython object construction.
 
-This document records what is *left* to do. It lists the remaining optimisations, what each would cost to unlock, and the measurements that justify them. Work that has already shipped is not tracked here — see `CHANGELOG.md` for history, [Performance & Benchmarks](benchmarks.md) for the 3.x to 4.0 benchmark story, [Architecture](architecture.md#core-tree-model) for the data-layout decisions and invariants that came out of it, and the [3.x → 4.0 migration guide](../user/rust-core-changes.md) for consumer-facing consequences.
+This document records what is *left* to do. It lists the remaining optimisations, what each would cost to unlock, and the measurements that justify them. Items completed since they were listed are marked done, with what remains; other shipped work is not tracked here — see `CHANGELOG.md` for history, [Performance & Benchmarks](benchmarks.md) for the 3.x to 4.0 benchmark story, [Architecture](architecture.md#core-tree-model) for the data-layout decisions and invariants that came out of it, and the [3.x → 4.0 migration guide](../user/rust-core-changes.md) for consumer-facing consequences.
 
 ---
 
 ## Current baseline
 
-Reference figures on an Apple M2 Max, release build (`maturin develop --release`), against the generated 400-interface Cisco IOS config used by the gate. Costs are in **calibration units**, which self-normalise across machines (1 unit ≈ 3.0 ms on this machine).
+Reference figures on an Apple M2 Max, release build (`maturin develop --release`), against the generated 400-interface Cisco IOS config used by the gate. Costs are in **calibration units**, which self-normalise across machines (1 unit ≈ 3.05 ms on this machine, CPython 3.14.4). The figures below are the range over two runs after Pass 7 (see [Performance & Benchmarks](benchmarks.md#pass-7-lazy-deltas-single-walk-rendering-and-cheaper-copies)).
 
 | Operation | Cost (units) | Wall clock | Gate ceiling | Remaining headroom |
 |---|---:|---:|---:|---|
-| `deepcopy` | 0.020 | 0.06 ms | 0.03 | ~35%, via [item 5](#5-compile-driver-rules-once-per-driver); ~13% via [item 7](#7-profile-guided-optimisation-for-release-wheels) |
-| `iteration` | 0.037 | 0.11 ms | 0.06 | ~0.011 units, via [item 2](#2-expose-a-bulkcolumnar-accessor) |
-| `remediation` | 0.123 | 0.37 ms | 0.19 | ~28% via item 5; ~13% via [item 6](#6-replace-siphash-in-the-children-index-with-a-seeded-fast-hasher); ~15% via item 7 |
-| `fast_load` | 0.162 | 0.48 ms | 0.24 | Items 5–7 apply; not separately measured |
-| `parse` | 0.184 | 0.55 ms | 0.27 | ~10% via item 5; ~12% via item 6; ~13% via item 7; see also [items 3](#3-store-node-text-without-a-per-node-allocation) and [4](#4-simd-byte-scans-in-the-parser) |
-| `dump` | 0.266 | 0.80 ms | 0.37 | ~45%, via [item 1](#1-change-dumpline-from-a-pydantic-model-to-a-__slots__-class) |
+| `deepcopy` | 0.014–0.015 | 0.05 ms | 0.03 | ~35%, via [item 5](#5-compile-driver-rules-once-per-driver); ~13% via [item 7](#7-profile-guided-optimisation-for-release-wheels) |
+| `iteration` | 0.037 | 0.11–0.12 ms | 0.06 | ~0.011 units, via [item 2](#2-expose-a-bulkcolumnar-accessor) |
+| `remediation` | 0.070–0.071 | 0.21–0.22 ms | 0.19 | item 5; [item 6](#6-replace-siphash-in-the-children-index-with-a-seeded-fast-hasher); item 7 |
+| `parse` | 0.114–0.119 | 0.35–0.36 ms | 0.24 | item 5; [item 14](#14-cheaper-per_line_sub-substitutions-while-parsing); items 6 and 7; see also [items 3](#3-store-node-text-without-a-per-node-allocation) and [4](#4-simd-byte-scans-in-the-parser) |
+| `fast_load` | 0.169 | 0.51–0.53 ms | 0.24 | [Item 16](#16-cheaper-line-marshalling-in-from_lines); items 5–7 apply |
+| `dump` | 0.297–0.307 | 0.91–0.95 ms | 0.45 | ~45%, via [item 1](#1-change-dumpline-from-a-pydantic-model-to-a-__slots__-class) |
 
-Re-derive these with `pytest -m benchmark tests/benchmarks/test_perf_regression.py -v -s` rather than trusting any number written down here. The headroom percentages for items 5–7 are separate measurements. They overlap, so do not add them together (see [Realistic ceiling](#realistic-ceiling)).
+Re-derive these with `pytest -m benchmark tests/benchmarks/test_perf_regression.py -v -s` rather than trusting any number written down here. The headroom percentages for items 5–7 were measured before Pass 7 and are separate measurements. They overlap, so do not add them together (see [Realistic ceiling](#realistic-ceiling)). The gate ceilings were not tightened after Pass 7, because no Linux CI measurements were available to calibrate them against.
 
 **Two operations have headroom that is gated on the object model** (items 1 and 2). The other four are Rust-bound, but they still have *compatible* headroom that earlier passes missed. Items 5–9 describe it:
 
@@ -153,7 +153,7 @@ What is left is the `Py::new` per node itself. That is only avoidable by not con
 
 ## 3. Store node text without a per-node allocation
 
-**Gain:** the largest remaining lever on `parse`. On the 50k-line IOS benchmark, building and freeing the tree is over 60% of the ~5.0 ms Rust core time.
+**Gain:** the largest remaining lever on `parse`. On the 50k-line IOS benchmark, building and freeing the tree is over 60% of the ~4.8 ms Rust core time. A Pass 7 profile of the 10k-line IOS parse attributes about 44% to `add_child`, 11% to freeing the tree and 5% to `is_already_normalized`; the other large share is per-line substitution ([item 14](#14-cheaper-per_line_sub-substitutions-while-parsing)).
 **Cost:** internal only — no public API change. A sizeable refactor of `crates/hier_config_core/src/tree/`.
 **Status:** not taken; unmeasured beyond the profile below.
 
@@ -244,7 +244,7 @@ Two things force the repeated syncs:
 
 **Gain:** up to ~12% of `parse` (and of the 50k-line parse), ~13% of `remediation`, and ~12% of end-to-end workflow time. These are upper bounds, measured with the unseeded `FxHashMap`.
 **Cost:** a new Rust dependency (`foldhash`), which needs discussion in an issue first. No public API change.
-**Status:** not taken.
+**Status:** hasher swap not taken. The cached-hash part of the follow-on below is done (Pass 7): index keys carry their seeded hash, so table growth no longer rehashes. Every probe and every insert still hashes the text once with `SipHash`, and the `future()` flat-additions profile is still led by `SipHash` inserts into the large root index. The binding's node-id maps already use `FxHashMap`; that is safe there because the keys are internal arena ids.
 
 `Children` keeps its text index as a linear list up to eight entries (`LINEAR_INDEX_MAX`). Above that it promotes to a `std::collections::HashMap` with the default `RandomState` (SipHash-1-3). Keys are attacker-controlled config lines, so a fixed hasher such as `FxHash` would allow hash flooding. The linear tier and the seeded hash were both chosen deliberately.
 
@@ -261,7 +261,7 @@ Switching the `Mapping` alias to `rustc_hash::FxHashMap` as a throwaway experime
 
 `FxHash` itself is ruled out because it is unseeded. **`foldhash`** is the replacement to evaluate. It is seeded per process (and per map), has no dependencies, is what `hashbrown` uses by default, and is documented as "minimally DoS-resistant", which is the property the index needs. Keep the linear tier. It avoids hashing entirely for the common case of a parent with a few children, and bounding it keeps the flood resistance.
 
-**Follow-on, larger:** store each node's text hash on the node when it is inserted, and probe with it through `hashbrown::HashTable`. Cross-tree lookups in remediation and `future()` would then use the stored hash instead of rehashing the running-side text. This is only worth doing if item 3 (shared text storage) is already changing the node layout.
+**Follow-on, larger:** reuse the stored hash for cross-tree lookups in remediation and `future()`, instead of rehashing the running-side text. That needs both trees' indexes to share one hasher seed, or a hash stored on the node rather than in the index. This is only worth doing if item 3 (shared text storage) is already changing the node layout. Storing the hash made each index entry larger: native `deepcopy_10k` became about 3% (3 µs) slower, so measure `deepcopy` with any further growth of the entry.
 
 **Measure first:** repeat the experiment with `foldhash` in place of Fx. Adopt it only if it keeps most of the gain above, and add a crafted-collision test to the property suite.
 
@@ -297,9 +297,10 @@ Treat PGO as a multiplier on the other items, not a substitute for them. Do it l
 
 ## 8. Render configuration text into one buffer
 
-**Gain:** unmeasured. The profile suggests that up to about half of render time is avoidable. Rendering a config costs about as much as parsing it: `str(config)` on the gate config takes 0.29 ms, against 0.38 ms to parse it. Rendering is not in the gate.
+**Status:** done in Pass 7 (single walk with carried depth, already-ordered child slices, one sectional-exit evaluation; `unified_diff` writes into one buffer). Native `render/to_lines_10k` went from 0.796 ms to 0.238 ms, `render/lines_10k` from 1.054 ms to 0.393 ms, and Python `str()` on the 10k config from 0.788 ms to 0.327 ms. What remains in `lines()` is one Python `str` per line, which its API requires. The original analysis is kept below for reference.
+
+**Gain (original estimate):** the profile suggested that up to about half of render time was avoidable. Rendering a config cost about as much as parsing it.
 **Cost:** internal only — no public API change.
-**Status:** not taken.
 
 `HConfig.__str__` calls `Tree::lines`, which returns one `String` per line. Each line comes from `cisco_style_text`, which builds an indentation string with `" ".repeat(depth)`, walks the parent chain to compute that depth, calls `format!`, and allocates a separate comment string. `__str__` then joins the whole `Vec<String>`. For every section it also evaluates the `sectional_exiting` rules twice: once in `sectional_exit` and again in `sectional_exit_text_parent_level`. `rendered_text_by_tags` has the same per-line `format!`.
 
@@ -411,11 +412,49 @@ Intern tag strings once per tree and store each node's tags as a small sorted id
 
 ## 13. Batch `Instance` construction in Python `merge`
 
-**Gain:** up to ~8 ms of the ~18 ms Python `merge()` of a 10k-line config. The subtree copy is already native; the rest is one pydantic `Instance` per copied node, and the profile is dominated by CPython allocation and GC. `model_construct` was tried and was slower.
-**Cost:** possibly a behaviour change. Sharing one `Instance` between nodes, or creating them lazily, changes object identity.
+**Status:** done in Pass 7. `Instance` is a frozen model, so one call now shares one record per distinct `(comments, tags)` value while still giving each node its own list. Together with `FxHashMap` for the binding's node-id maps, Python `merge()` of the 10k config into an empty tree went from 14.1 ms to 3.7 ms.
+
+**What remains:** native `merge_10k` takes about 0.6 ms, so about 3 ms of the Python call is still boundary cost. A profile shows CPython object allocation and freeing, garbage-collector tracking of the new lists (`visit_add_to_container`), cloning and dropping the `BTreeSet<String>` memo keys, and dictionary inserts. Materialising `instances` lazily on first access would remove most of it, but changes when the objects are created; check the public contract first.
+
+---
+
+## 14. Cheaper `per_line_sub` substitutions while parsing
+
+**Gain:** up to about a quarter of a 10k-line IOS parse. A Pass 7 profile attributes about 27% of the native parse to `PreparedSubs::apply`.
+**Cost:** internal only, but a general solution needs regex syntax analysis, which means a new direct dependency (`regex-syntax`) and an issue first.
 **Status:** not taken.
 
-Check what the public contract promises about `instances` first. If identity is not promised, share one `Instance` per distinct `(comments, tags)` value within a merge. Otherwise store instances natively and materialise them on first access to `instances`. Like items 1 and 2, this is an object-model question rather than Rust work.
+`PreparedSubs` screens each line with a `RegexSet` and then runs only the substitutions the set reports. A line that matches pays for `is_match` on the set, `matches` on the set, `replace_all` for each candidate, and `matches` again on every rewritten result: an IOS comment line (`!`) goes through three set passes and a substitution before it is dropped. All the stock IOS `per_line_sub` patterns are anchored at `^`, so most lines could be rejected from their first bytes. Options, cheapest first:
+
+- Derive a literal first-byte or prefix screen for anchored patterns, and skip the `RegexSet` for lines that cannot match. Deriving it safely for arbitrary user patterns is the part that needs `regex-syntax`.
+- Skip the second `matches` pass when a substitution empties the line and no later pattern can match an empty string (checked once when the rules are prepared).
+- Fast-path whole-line deletions (`^\s*[#!].*` replaced by an empty string) so they skip `replace_all`.
+
+Each option must keep the substitution order and results identical, including for user-defined rules and non-ASCII lines.
+
+**Measure first:** `parse/ios_10k` and `parse/unicode_10k` in the Criterion suite, plus a driver with a non-anchored custom substitution.
+
+---
+
+## 15. Cheaper `deepcopy` clones
+
+**Gain:** unmeasured. Native `deepcopy_10k` is about 0.15 ms, roughly 15 ns per node.
+**Cost:** internal only. Tied to the node layout ([item 3](#3-store-node-text-without-a-per-node-allocation)).
+**Status:** not taken.
+
+`Tree::clone` is dominated by allocator calls and `Arc` reference-count increments for each node's text, child vector and index. Pass 7 measured no Python-visible change (0.124 ms against 0.123 ms) and a 3% native slowdown from the larger cached-hash index entries. Flattening children into the arena, or sharing immutable index tables copy-on-write, would cut the allocations. Both are layout changes that belong with item 3.
+
+---
+
+## 16. Cheaper line marshalling in `from_lines`
+
+**Gain:** small. `HConfig.from_lines()` (also behind `get_hconfig_fast_load`) takes about 1.16–1.20x as long as `HConfig.from_text()` on the same 10k-line config, before and after Pass 7.
+**Cost:** internal only.
+**Status:** not taken.
+
+The binding copies every Python `str` into one buffer with offsets, and the Python constructor first copies the input with `list(lines)`. A profile shows `PyUnicode_AsUTF8AndSize`, the list iterator and `memmove` from buffer growth. Pre-sizing the buffer with a separate length pass was measured and was **slower** (from_lines 0.92 ms to 1.00 ms), because the extra pass costs more than the reallocations it saves. Avoiding the `list()` copy for tuples and lists is the next thing to try.
+
+`test_fast_load_vs_get_hconfig` in `tests/benchmarks/test_benchmarks.py` asserts that `from_lines` is no slower than 1.1x `from_text`. That bound is already exceeded on this machine (it fails intermittently with or without Pass 7), so revisit the bound or the marshalling before relying on that test.
 
 ---
 
@@ -471,7 +510,8 @@ Several of these suggestions come up repeatedly, so this list records that they 
 
 - `lto = "fat"`, `codegen-units = 1` and `opt-level = 3` (workspace `Cargo.toml`), plus `mimalloc` as the global allocator (`crates/hier_config_py`).
 - PyO3 0.27, not 0.24.
-- Linear child lookup for up to eight children (`LINEAR_INDEX_MAX`), with a seeded `SipHash` map above that.
+- Linear child lookup for up to eight children (`LINEAR_INDEX_MAX`), with a seeded `SipHash` map above that whose keys cache their hash.
+- Remediation, rollback and `difference` create delta sections lazily; rendering and `dump()` walk the tree once; copies share node text (Pass 7).
 - A bounded regex cache: at most 512 entries per engine (`regex_cache.rs`).
 - `HConfig` objects are freed. `SharedTree.root_handle` is a weak reference, so no reference cycle survives outside CPython's view. A `weakref` to a dropped `HConfig` is cleared after `gc.collect()`.
 - Parsing and workflow remediation already release the GIL (item 9).
@@ -492,8 +532,8 @@ Several of these suggestions come up repeatedly, so this list records that they 
 
 ## Realistic ceiling
 
-Taking items 1 and 2 would land `iteration` at ~0.026 units and `dump` at ~0.15. Items 3 and 4 only move `parse`: together they are unlikely to take more than 1–1.5 ms off the 50k-line benchmark's ~5.0 ms core time.
+Taking items 1 and 2 would land `iteration` at ~0.026 units and `dump` at ~0.15. Items 3, 4 and 14 only move `parse`: items 3 and 4 together are unlikely to take more than 1–1.5 ms off the 50k-line benchmark's ~4.8 ms core time, and item 14 could take up to about a quarter.
 
 Items 5–8 are internal and compatible with each other. Their measured gains overlap: PGO speeds up code that items 5 and 6 would delete, and removing rule syncs makes hashing a larger share of what remains. **Estimate**, not a measurement: taken together, they are likely to take 25–40% off `remediation` and `deepcopy`, 20–30% off `parse`, and a similar share off end-to-end workflow time. Measure after each item rather than assuming the sum. Item 9 does not change single-call latency, but together with item 5 it should move 8-thread throughput from the current 3.4x towards the 5.6x native ceiling measured for the same job. Item 2 is the one large gain available to extraction workloads: ~4–5x over `dump()` as lists, and far more as Arrow.
 
-A blanket "2x across the board" is **not** achievable while the current API holds — that is a measured result, not a prediction. The work already done cleared 1.35–1.86x on the Rust-bound operations and 2.6x on `iteration`, and moved `dump` almost not at all. The large remaining gains are concentrated in exactly two operations, and both are paid for in compatibility or in new API surface. The other operations have smaller headroom that needs no API change (items 3–8).
+A blanket "2x across the board" is **not** achievable while the current API holds — that is a measured result, not a prediction. The work before Pass 7 cleared 1.35–1.86x on the Rust-bound operations and 2.6x on `iteration`, and moved `dump` almost not at all. Pass 7 then cut Python remediation, `future()`, rollback, `str()`, `unified_diff()`, `difference()` and `merge()` by 26–74%, but parse, `deepcopy`, `dump()` and `all_children_sorted()` by 1–7% at most. The large remaining gains are concentrated in exactly two operations, and both are paid for in compatibility or in new API surface. The other operations have smaller headroom that needs no API change (items 3–8).

@@ -40,7 +40,11 @@ v4 design decisions, for the record:
   remediation, rollback, future, traversal, dump, merge, unified diff and
   difference on the same generated configs as the Python benchmarks, including
   non-ASCII workloads, and support saved baselines for before/after
-  comparisons. `criterion` is a dev-dependency only. (#302)
+  comparisons. Further cases cover `fast_load`, `lines()`/`to_lines()`
+  rendering, remediation of fully changed and of disjoint configs, and flat
+  `future()` additions. `criterion` is a dev-dependency only. (#302)
+- Python benchmarks for `str()`, `dump()`, `unified_diff()`, `difference()`
+  and `merge()` in `tests/benchmarks/test_benchmarks.py`. (#302)
 - `NodeComments`, a public set-like view over one node's comments, returned by
   `HConfigChild.comments`. It exposes the full mutable-set API (`add`,
   `discard`, `remove`, `pop`, `update`, `clear`, `copy`, the algebra operators
@@ -288,6 +292,19 @@ v4 design decisions, for the record:
   `Instance` records appended to `instances` are unchanged, and `HConfig`
   subclasses that override `add_deep_copy_of` still have it called. Shallow
   copies of branch nodes also skip the recursive tag walk they discarded. (#302)
+- Further Rust performance work with no change to the Python API. Remediation,
+  rollback and `difference()` create delta sections only when something under
+  them changes, and renaming a node updates its parent's index in place, which
+  makes remediating two completely different configs linear instead of
+  quadratic. `lines()`, `to_lines()`, `str()` and `dump()` render in one walk,
+  `unified_diff()` matches aligned children by position, copies share node
+  text, and the child index caches each key's seeded hash. On the 10k-line IOS
+  benchmark, Python remediation is about 34% faster, `str()` 59%,
+  `unified_diff()` 54% and `difference()` 45%. `HConfig.merge()` shares one
+  immutable `Instance` record between copied nodes with the same comments and
+  tags (each node still has its own `instances` list), making it about 74%
+  faster. Native `deepcopy` is about 3% slower because index entries are
+  larger. See [Performance & Benchmarks](docs/dev/benchmarks.md). (#302)
 - `HConfigChild.comments` is now a live view over the node's comments rather
   than a detached copy. Mutating the returned object — `child.comments.add(…)`
   — now updates the configuration, where previously the change was silently
