@@ -295,21 +295,40 @@ pub(crate) fn leading_whitespace_len(line: &str) -> usize {
     line.len() - line.trim_start().len()
 }
 
-/// Returns `true` for the characters Python's `str.splitlines()` treats as line
-/// boundaries but `str::lines()` ignores.
-const fn is_line_boundary(character: char) -> bool {
-    matches!(
-        character,
-        '\n' | '\r'
-            | '\u{0b}'
-            | '\u{0c}'
-            | '\u{1c}'
-            | '\u{1d}'
-            | '\u{1e}'
-            | '\u{85}'
-            | '\u{2028}'
-            | '\u{2029}'
-    )
+/// Finds the first line boundary in `bytes`, returning its offset and byte length.
+///
+/// Every boundary is either an ASCII control byte below `0x20` or a multibyte
+/// sequence led by `0xC2` (NEL) or `0xE2` (LS/PS), so whole 8-byte words holding
+/// only printable ASCII are skipped without decoding. `bytes` is valid UTF-8, so a
+/// lead byte is always a character start and the follow-up checks are exact.
+fn find_line_boundary(bytes: &[u8]) -> Option<(usize, usize)> {
+    const LOW_BITS: u64 = u64::from_ne_bytes([0x01; 8]);
+    const HIGH_BITS: u64 = u64::from_ne_bytes([0x80; 8]);
+    let mut offset = 0;
+    let (words, _) = bytes.as_chunks::<8>();
+    for word in words {
+        let value = u64::from_ne_bytes(*word);
+        // Non-zero iff some byte is below 0x20 or has its high bit set.
+        if (value.wrapping_sub(LOW_BITS * 0x20) | value) & HIGH_BITS != 0
+            && let Some(found) = scan_bytes(bytes, offset, offset + 8)
+        {
+            return Some(found);
+        }
+        offset += 8;
+    }
+    scan_bytes(bytes, offset, bytes.len())
+}
+
+fn scan_bytes(bytes: &[u8], start: usize, end: usize) -> Option<(usize, usize)> {
+    (start..end).find_map(|index| {
+        let length = match bytes[index] {
+            b'\n' | b'\r' | 0x0b | 0x0c | 0x1c..=0x1e => 1,
+            0xC2 if bytes.get(index + 1) == Some(&0x85) => 2,
+            0xE2 if matches!(bytes.get(index + 1..index + 3), Some([0x80, 0xA8 | 0xA9])) => 3,
+            _ => return None,
+        };
+        Some((index, length))
+    })
 }
 
 /// Iterator returned by [`splitlines`].
@@ -323,14 +342,14 @@ impl<'a> Iterator for SplitLines<'a> {
 
     fn next(&mut self) -> Option<&'a str> {
         let rest = self.rest?;
-        let Some((index, character)) = rest.char_indices().find(|(_, c)| is_line_boundary(*c))
-        else {
+        let bytes = rest.as_bytes();
+        let Some((index, length)) = find_line_boundary(bytes) else {
             self.rest = None;
             return (!rest.is_empty()).then_some(rest);
         };
         let line = &rest[..index];
-        let mut next_start = index + character.len_utf8();
-        if character == '\r' && rest[next_start..].starts_with('\n') {
+        let mut next_start = index + length;
+        if bytes[index] == b'\r' && bytes.get(next_start) == Some(&b'\n') {
             next_start += 1;
         }
         self.rest = Some(&rest[next_start..]);
@@ -542,7 +561,10 @@ pub fn parse_into_tree(tree: &mut Tree, config_raw: &str) -> Result<(), TreeErro
 
     // Most lines become a node, so sizing the arena up front avoids repeatedly
     // reallocating and copying the node table while parsing a large configuration.
-    tree.arena.reserve(splitlines(&config_text).count());
+    // This is only a capacity hint: counting `\n` bytes vectorises, whereas a
+    // second `splitlines` pass would rescan every boundary kind.
+    tree.arena
+        .reserve(config_text.bytes().filter(|&byte| byte == b'\n').count() + 1);
 
     for raw_line in splitlines(&config_text) {
         if state.banner.in_banner {
