@@ -16,7 +16,7 @@ use std::hint::black_box;
 use std::time::Duration;
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
-use hier_config_core::{Platform, Tree, WorkflowRemediation};
+use hier_config_core::{Platform, Tree, WorkflowRemediation, load_fast};
 
 const IOS: Platform = Platform::CiscoIos;
 const OSPF_COST: &str = " ip ospf cost 100";
@@ -126,6 +126,16 @@ fn bench_parse(c: &mut Criterion) {
             b.iter(|| Tree::from_str(platform, black_box(&text)).expect("parses"));
         });
     }
+    // `HConfig.from_lines`: pre-split lines, only `per_line_sub` preprocessing.
+    let text = ios_config(1200);
+    let lines: Vec<&str> = text.lines().collect();
+    group.bench_function("fast_load_ios_10k", |b| {
+        b.iter(|| {
+            let mut tree = Tree::for_platform(IOS);
+            load_fast(&mut tree, black_box(&lines), true).expect("loads");
+            tree
+        });
+    });
     group.finish();
 }
 
@@ -136,6 +146,13 @@ fn bench_tree(c: &mut Criterion) {
         b.iter(|| black_box(&tree).all_children_sorted(tree.root));
     });
     c.bench_function("dump_10k", |b| b.iter(|| black_box(&tree).dump()));
+    // `str(config)` renders with sectional exits; `to_lines()` renders without.
+    c.bench_function("render/lines_10k", |b| {
+        b.iter(|| black_box(&tree).lines(tree.root, true));
+    });
+    c.bench_function("render/to_lines_10k", |b| {
+        b.iter(|| black_box(&tree).dump_simple(false));
+    });
     c.bench_function("merge_10k", |b| {
         b.iter_batched(
             || Tree::new(tree.driver.clone()),
@@ -154,12 +171,30 @@ fn bench_remediation(c: &mut Criterion) {
         ("10k", ios_config(1200), 100),
         ("50k", ios_config(6000), 200),
         ("unicode_10k", unicode_config(1200), 100),
+        ("10k_all_changed", ios_config(1200), usize::MAX),
     ] {
         let (running, generated) = remediation_pair(&text, changes);
         group.bench_function(name, |b| {
             b.iter(|| black_box(&running).config_to_get_to(black_box(&generated)));
         });
     }
+    // Mirrors `test_remediation_completely_different`: nothing in common.
+    let disjoint_running = parse(&ios_config(500));
+    let mut other = String::from("hostname OTHER-ROUTER\n");
+    for i in 0..500 {
+        writeln!(
+            other,
+            "interface Loopback{i}\n description Loopback {i}\n \
+             ip address 192.168.{}.{} 255.255.255.255",
+            i / 256,
+            i % 256
+        )
+        .expect(WRITE);
+    }
+    let disjoint_generated = parse(&other);
+    group.bench_function("disjoint_500", |b| {
+        b.iter(|| black_box(&disjoint_running).config_to_get_to(black_box(&disjoint_generated)));
+    });
     group.finish();
 
     let (running, generated) = remediation_pair(&ios_config(1000), 100);
@@ -173,6 +208,18 @@ fn bench_remediation(c: &mut Criterion) {
     );
     c.bench_function("future_1000_interfaces", |b| {
         b.iter(|| black_box(&running).future(black_box(&remediation), false));
+    });
+    // Mirrors `test_future_flat_additions_scale_linearly` at its larger size.
+    let flat = |prefix: &str| {
+        let lines: Vec<String> = (0..4000).map(|i| format!("{prefix} {i}")).collect();
+        let mut tree = Tree::for_platform(Platform::Generic);
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        load_fast(&mut tree, &refs, true).expect("loads");
+        tree
+    };
+    let (flat_running, flat_changes) = (flat("existing"), flat("new"));
+    c.bench_function("future_flat_additions_4000", |b| {
+        b.iter(|| black_box(&flat_running).future(black_box(&flat_changes), false));
     });
     c.bench_function("rollback_1000_interfaces", |b| {
         b.iter(|| {
