@@ -180,3 +180,28 @@ def test_deep_copy_into_a_child_and_within_one_tree() -> None:
     assert [child.text for child in within.children] == [
         "neighbor 192.0.2.1 remote-as 65001"
     ]
+
+
+def test_merge_gives_every_node_its_own_instance_list() -> None:
+    source = _source("r1", "shutdown")
+    merged = get_hconfig(Platform.CISCO_IOS).merge(source)
+
+    lists = [child.instances for child in merged.all_children()]
+    assert len({id(items) for items in lists}) == len(lists)
+    expected = {
+        "description uplink": Instance(
+            id=id(source), comments=frozenset(), tags=frozenset({"tag-r1"})
+        ),
+        "interface Ethernet1": Instance(
+            id=id(source),
+            comments=frozenset({"from r1"}),
+            tags=frozenset({"tag-r1"}),
+        ),
+        "shutdown": Instance(id=id(source), comments=frozenset(), tags=frozenset()),
+    }
+    for child in merged.all_children():
+        default = Instance(id=id(source), comments=frozenset(), tags=frozenset())
+        assert child.instances == [expected.get(child.text, default)]
+
+    lists[0].append(Instance(id=1, comments=frozenset(), tags=frozenset()))
+    assert all(len(items) == 1 for items in lists[1:])

@@ -1,11 +1,11 @@
 //! Shared tree state and handle interning cache.
 
-use std::collections::HashMap;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use hier_config_core::{NodeId, Platform, Tree};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PySet, PyWeakrefMethods, PyWeakrefReference};
+use rustc_hash::FxHashMap;
 
 /// Lock poisoning is an error, not permission to continue with damaged state.
 pub(crate) trait PyRwLockExt<T> {
@@ -56,8 +56,10 @@ pub struct NodePyData {
 pub struct SharedTree {
     pub tree: RwLock<Tree>,
     pub platform: Platform,
-    pub node_data: RwLock<HashMap<NodeId, NodePyData>>,
-    pub intern_cache: RwLock<HashMap<NodeId, Py<PyWeakrefReference>>>,
+    // Keyed by internal arena ids rather than configuration text, so the
+    // unseeded Fx hasher cannot be flooded by crafted input.
+    pub node_data: RwLock<FxHashMap<NodeId, NodePyData>>,
+    pub intern_cache: RwLock<FxHashMap<NodeId, Py<PyWeakrefReference>>>,
     /// Weak handle to the owning `HConfig`.
     ///
     /// A strong `Py<PyAny>` here would close a reference cycle through the Rust
@@ -90,8 +92,8 @@ impl SharedTree {
         Self {
             tree: RwLock::new(tree),
             platform,
-            node_data: RwLock::new(HashMap::new()),
-            intern_cache: RwLock::new(HashMap::new()),
+            node_data: RwLock::new(FxHashMap::default()),
+            intern_cache: RwLock::new(FxHashMap::default()),
             root_handle: RwLock::new(None),
             driver_obj: RwLock::new(None),
             synced_rules: RwLock::new(None),

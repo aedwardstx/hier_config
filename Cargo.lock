@@ -367,6 +367,7 @@ dependencies = [
  "mimalloc",
  "pyo3",
  "pyo3-stub-gen",
+ "rustc-hash 2.1.3",
  "serde",
  "serde_json",
  "tempfile",

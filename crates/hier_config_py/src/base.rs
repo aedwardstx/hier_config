@@ -1,6 +1,6 @@
 //! Base class `PyHConfigBase` wrapping a node in the shared configuration tree.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use hier_config_core::models::Instance;
@@ -170,14 +170,35 @@ impl PyHConfigBase {
             let root = crate::child::PyHConfigChild::root_object(py, source_tree)?;
             let root_id = root.bind(py).as_ptr() as usize;
             let instance_cls = py.import("hier_config.models")?.getattr("Instance")?;
-            for (node_id, instance) in records {
-                let kwargs = PyDict::new(py);
-                kwargs.set_item("id", root_id)?;
-                kwargs.set_item("comments", PyFrozenSet::new(py, &instance.comments)?)?;
-                kwargs.set_item("tags", PyFrozenSet::new(py, &instance.tags)?)?;
-                let record = instance_cls.call((), Some(&kwargs))?;
-                self.tree
-                    .get_node_instances(py, node_id)?
+            // `Instance` is a frozen model and every record here shares the
+            // source root's id, so nodes with equal comments and tags can share
+            // one validated object instead of constructing one per node.
+            let mut built: HashMap<(&BTreeSet<String>, &BTreeSet<String>), Bound<'_, PyAny>> =
+                HashMap::new();
+            let mut appends = Vec::with_capacity(records.len());
+            for (node_id, instance) in &records {
+                let key = (&instance.comments, &instance.tags);
+                let record = if let Some(record) = built.get(&key) {
+                    record.clone()
+                } else {
+                    let kwargs = PyDict::new(py);
+                    kwargs.set_item("id", root_id)?;
+                    kwargs.set_item("comments", PyFrozenSet::new(py, &instance.comments)?)?;
+                    kwargs.set_item("tags", PyFrozenSet::new(py, &instance.tags)?)?;
+                    let record = instance_cls.call((), Some(&kwargs))?;
+                    built.insert(key, record.clone());
+                    record
+                };
+                appends.push((*node_id, record));
+            }
+            let _tree = self.read_tree()?;
+            let mut data_map = self.tree.node_data.write_py()?;
+            for (node_id, record) in appends {
+                data_map
+                    .entry(node_id)
+                    .or_default()
+                    .instances
+                    .get_or_insert_with(|| PyList::empty(py).unbind())
                     .bind(py)
                     .append(record)?;
             }
