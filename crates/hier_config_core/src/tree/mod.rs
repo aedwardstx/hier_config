@@ -342,36 +342,67 @@ impl Tree {
         return_if_present: bool,
     ) -> Result<NodeId, TreeError> {
         let trimmed = self.validated_child_text(parent_id, text)?;
-        let shared: Arc<str> = Arc::from(trimmed);
+        self.add_validated_child(
+            parent_id,
+            &Arc::from(trimmed),
+            check_if_present,
+            return_if_present,
+        )
+    }
 
+    /// [`Tree::add_child`] for text already held in an `Arc`, which the new
+    /// node shares when it needs no trimming.
+    fn add_shared_text_child(
+        &mut self,
+        parent_id: NodeId,
+        text: &Arc<str>,
+        check_if_present: bool,
+        return_if_present: bool,
+    ) -> Result<NodeId, TreeError> {
+        let trimmed = self.validated_child_text(parent_id, text)?;
+        let shared = if trimmed.len() == text.len() {
+            Arc::clone(text)
+        } else {
+            Arc::from(trimmed)
+        };
+        self.add_validated_child(parent_id, &shared, check_if_present, return_if_present)
+    }
+
+    fn add_validated_child(
+        &mut self,
+        parent_id: NodeId,
+        shared: &Arc<str>,
+        check_if_present: bool,
+        return_if_present: bool,
+    ) -> Result<NodeId, TreeError> {
         if !check_if_present {
-            let child_id = self.insert_child_node(parent_id, &shared);
+            let child_id = self.insert_child_node(parent_id, shared);
             self.arena[parent_id]
                 .children
-                .append(&shared, child_id, true);
+                .append(shared, child_id, true);
             return Ok(child_id);
         }
 
         let predicted = self.arena.next_id();
-        let Some(existing_id) = self.arena[parent_id].children.claim(&shared, predicted) else {
-            let child_id = self.insert_child_node(parent_id, &shared);
+        let Some(existing_id) = self.arena[parent_id].children.claim(shared, predicted) else {
+            let child_id = self.insert_child_node(parent_id, shared);
             debug_assert_eq!(child_id, predicted);
             self.arena[parent_id].children.push_claimed(child_id);
             return Ok(child_id);
         };
 
         if self.is_duplicate_child_allowed(parent_id) {
-            let child_id = self.insert_child_node(parent_id, &shared);
+            let child_id = self.insert_child_node(parent_id, shared);
             self.arena[parent_id]
                 .children
-                .append(&shared, child_id, false);
+                .append(shared, child_id, false);
             return Ok(child_id);
         }
         if return_if_present {
             return Ok(existing_id);
         }
         let mut path = self.path(parent_id);
-        path.push(trimmed.to_string());
+        path.push(shared.to_string());
         Err(TreeError::DuplicateChild(path))
     }
 
@@ -486,39 +517,101 @@ impl Tree {
             .arena
             .get(source_id)
             .ok_or(TreeError::NodeNotFound(source_id))?;
-        let new_id = self.add_child(parent_id, &src_node.text, true, merged)?;
-
-        let is_leaf = src_node.is_leaf();
-        // The recursive tag union is only needed for a leaf's own tags or a merge
-        // instance; branches never store it, so skip the subtree walk otherwise.
-        let tags = if is_leaf || merged {
+        // A merge instance records the recursive tag union; a leaf's union is
+        // its own tags, which `copy_node_from` reads directly.
+        let branch_tags = if merged && !source_tree.has_own_tags(source_id, src_node) {
             source_tree.tags(source_id)
         } else {
             BTreeSet::new()
         };
-        let instance = merged.then(|| Instance {
-            id: u64::from(source_id.index),
-            comments: src_node.comments().clone(),
-            tags: tags.clone(),
-        });
-        let order_weight = src_node.order_weight;
-        let comments = src_node.comments().clone();
+        self.copy_node_from(parent_id, source_tree, source_id, merged, branch_tags)
+    }
+
+    /// Whether `tags(node_id)` is the node's own tag set rather than a union
+    /// over its children.
+    fn has_own_tags(&self, node_id: NodeId, node: &Node) -> bool {
+        node.is_leaf() && node_id != self.root
+    }
+
+    /// Copies one node from `source_tree` under `parent_id`. A merged copy
+    /// records an instance whose tags are `branch_tags` for branches.
+    fn copy_node_from(
+        &mut self,
+        parent_id: NodeId,
+        source_tree: &Self,
+        source_id: NodeId,
+        merged: bool,
+        branch_tags: BTreeSet<String>,
+    ) -> Result<NodeId, TreeError> {
+        let src_node = source_tree
+            .arena
+            .get(source_id)
+            .ok_or(TreeError::NodeNotFound(source_id))?;
+        let new_id = self.add_shared_text_child(parent_id, &src_node.text, true, merged)?;
+        let own_tags = source_tree
+            .has_own_tags(source_id, src_node)
+            .then(|| src_node.tags());
+        let comments = src_node.comments();
 
         let target_node = &mut self.arena[new_id];
-        target_node.order_weight = order_weight;
+        target_node.order_weight = src_node.order_weight;
         // Empty writes would allocate an extras block for nothing; `Node`
         // equality and serialisation treat both representations alike.
         if !comments.is_empty() {
-            target_node.comments_mut().extend(comments);
+            target_node.comments_mut().extend(comments.iter().cloned());
         }
-        if let Some(instance) = instance {
-            target_node.instances_mut().push(instance);
+        if merged {
+            target_node.instances_mut().push(Instance {
+                id: u64::from(source_id.index),
+                comments: comments.clone(),
+                tags: own_tags.map_or(branch_tags, BTreeSet::clone),
+            });
         }
-        if is_leaf && !tags.is_empty() {
-            target_node.tags_mut().extend(tags);
+        if let Some(tags) = own_tags
+            && !tags.is_empty()
+        {
+            target_node.tags_mut().extend(tags.iter().cloned());
         }
 
         Ok(new_id)
+    }
+
+    /// Merged deep copy that returns the copied subtree's tag union, so each
+    /// branch instance is filled from its children instead of rewalking them.
+    fn deep_copy_merged(
+        &mut self,
+        parent_id: NodeId,
+        source_tree: &Self,
+        source_id: NodeId,
+        on_copy: &mut impl FnMut(NodeId, NodeId),
+    ) -> Result<(NodeId, BTreeSet<String>), TreeError> {
+        let new_id =
+            self.copy_node_from(parent_id, source_tree, source_id, true, BTreeSet::new())?;
+        on_copy(new_id, source_id);
+        let src_node = &source_tree.arena[source_id];
+        if source_tree.has_own_tags(source_id, src_node) {
+            return Ok((new_id, src_node.tags().clone()));
+        }
+        let mut union = BTreeSet::new();
+        let mut result = Ok(());
+        for child_id in src_node.children.iter() {
+            match self.deep_copy_merged(new_id, source_tree, child_id, on_copy) {
+                Ok((_, tags)) if union.is_empty() => union = tags,
+                Ok((_, tags)) => union.extend(tags),
+                Err(error) => {
+                    // Keep the instance complete, as an eager union would be.
+                    union = source_tree.tags(source_id);
+                    result = Err(error);
+                    break;
+                }
+            }
+        }
+        if !union.is_empty()
+            && let Some(instance) = self.arena[new_id].instances_mut().last_mut()
+        {
+            instance.tags.clone_from(&union);
+        }
+        result.map(|()| (new_id, union))
     }
 
     /// Adds a shallow copy of a node that lives in the *same* tree.
@@ -608,10 +701,16 @@ impl Tree {
         merged: bool,
         on_copy: &mut impl FnMut(NodeId, NodeId),
     ) -> Result<NodeId, TreeError> {
-        let new_child = self.add_shallow_copy_of(parent_id, source_tree, source_id, merged)?;
+        if merged {
+            return self
+                .deep_copy_merged(parent_id, source_tree, source_id, on_copy)
+                .map(|(new_child, _)| new_child);
+        }
+        let new_child =
+            self.copy_node_from(parent_id, source_tree, source_id, false, BTreeSet::new())?;
         on_copy(new_child, source_id);
         for child_id in source_tree.arena[source_id].children.iter() {
-            self.add_deep_copy_of_with(new_child, source_tree, child_id, merged, on_copy)?;
+            self.add_deep_copy_of_with(new_child, source_tree, child_id, false, on_copy)?;
         }
         Ok(new_child)
     }
