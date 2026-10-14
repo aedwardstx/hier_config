@@ -180,3 +180,49 @@ fn difference_creates_only_sections_on_the_path_to_a_difference() {
             .is_empty()
     );
 }
+
+#[test]
+fn large_indexes_survive_growth_renames_removal_and_serde() {
+    let lines: Vec<String> = (0..2_000).map(|i| format!("line {i}")).collect();
+    let mut tree = generic(&lines.join("\n"));
+    let root = tree.root;
+    for (position, line) in lines.iter().enumerate() {
+        let id = tree.arena[root].children.get(line).unwrap();
+        assert_eq!(tree.arena[root].children.get_index(position), Some(id));
+    }
+    assert!(tree.arena[root].children.get("line 2000").is_none());
+    let duplicate = append_duplicate(&mut tree, root, "line 7");
+    assert_ne!(tree.arena[root].children.get("line 7"), Some(duplicate));
+    assert_index_matches_rebuild(&tree, root);
+
+    let last = last_child(&tree, root);
+    tree.set_text(last, "renamed last");
+    assert_eq!(tree.arena[root].children.get("renamed last"), Some(last));
+    assert_eq!(
+        tree.arena[root].children.get("line 7"),
+        tree.arena[root].children.get_index(7)
+    );
+    let middle = tree.arena[root].children.get("line 1000").unwrap();
+    tree.set_text(middle, "line 1");
+    assert_ne!(tree.arena[root].children.get("line 1"), Some(middle));
+    assert!(!tree.arena[root].children.contains("line 1000"));
+    assert_index_matches_rebuild(&tree, root);
+
+    let children = tree.arena[root].children.clone();
+    let mut keys: Vec<&str> = children.keys().collect();
+    keys.sort_unstable();
+    keys.dedup();
+    assert_eq!(keys.len(), children.keys().count());
+    let round_trip: Children =
+        serde_json::from_str(&serde_json::to_string(&children).unwrap()).unwrap();
+    assert_eq!(round_trip, children);
+    for key in children.keys() {
+        assert_eq!(round_trip.get(key), children.get(key));
+    }
+
+    let mut root_children = std::mem::take(&mut tree.arena[root].children);
+    root_children.delete_by_text("line 1", &tree.arena);
+    tree.arena[root].children = root_children;
+    assert!(!tree.arena[root].children.contains("line 1"));
+    assert_index_matches_rebuild(&tree, root);
+}

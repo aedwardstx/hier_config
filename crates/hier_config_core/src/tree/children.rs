@@ -1,8 +1,10 @@
 use crate::arena::{Arena, NodeId};
 use crate::tree::node::Node;
 use serde::{Deserialize, Serialize};
+use std::borrow::Borrow;
 use std::collections::HashMap;
-use std::collections::hash_map::Entry;
+use std::collections::hash_map::{Entry, RandomState};
+use std::hash::{BuildHasher, BuildHasherDefault, Hash, Hasher};
 use std::sync::Arc;
 
 /// Text-keyed index from a child's text to the *first* child that carries it.
@@ -13,6 +15,8 @@ use std::sync::Arc;
 /// hasher is fixed and unseeded, so a crafted configuration could force every line
 /// into one bucket and degrade insertion to O(n^2). Maps keyed by internal
 /// integers/`NodeId`s are not reachable this way and keep using `FxHashMap`.
+///
+/// This is the serialised form; in memory a large index is a [`HashedIndex`].
 type Mapping = HashMap<Arc<str>, NodeId>;
 
 /// Largest index kept as a linear list before it is promoted to a [`Mapping`].
@@ -22,11 +26,163 @@ type Mapping = HashMap<Arc<str>, NodeId>;
 /// the list keeps each scan constant-time, so hash-flooding protection holds.
 const LINEAR_INDEX_MAX: usize = 8;
 
+/// An index key with its `SipHash`, computed once from the owning
+/// [`HashedIndex`]'s randomly seeded state.
+///
+/// Growing a table rehashes every key; storing the hash means growth reuses it
+/// instead of rereading each configuration line.
+#[derive(Debug, Clone)]
+struct HashedKey {
+    hash: u64,
+    text: Arc<str>,
+}
+
+/// A key as seen by lookups, so a `&str` probe can be hashed once and matched
+/// against stored [`HashedKey`]s without allocating an `Arc`.
+trait KeyView {
+    fn hash_value(&self) -> u64;
+    fn text(&self) -> &str;
+}
+
+struct Probe<'a> {
+    hash: u64,
+    text: &'a str,
+}
+
+impl KeyView for Probe<'_> {
+    fn hash_value(&self) -> u64 {
+        self.hash
+    }
+    fn text(&self) -> &str {
+        self.text
+    }
+}
+
+impl KeyView for HashedKey {
+    fn hash_value(&self) -> u64 {
+        self.hash
+    }
+    fn text(&self) -> &str {
+        &self.text
+    }
+}
+
+impl<'a> Borrow<dyn KeyView + 'a> for HashedKey {
+    fn borrow(&self) -> &(dyn KeyView + 'a) {
+        self
+    }
+}
+
+impl Hash for dyn KeyView + '_ {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.hash_value());
+    }
+}
+
+impl PartialEq for dyn KeyView + '_ {
+    fn eq(&self, other: &Self) -> bool {
+        self.hash_value() == other.hash_value() && self.text() == other.text()
+    }
+}
+
+impl Eq for dyn KeyView + '_ {}
+
+impl Hash for HashedKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.hash);
+    }
+}
+
+impl PartialEq for HashedKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.hash == other.hash && self.text == other.text
+    }
+}
+
+impl Eq for HashedKey {}
+
+/// Hands a [`HashedKey`]'s precomputed hash straight to the table.
+#[derive(Default)]
+struct StoredHash(u64);
+
+impl Hasher for StoredHash {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        // Keys only ever write their stored `u64`; fold anything else in so the
+        // hasher stays total.
+        for &byte in bytes {
+            self.0 = self.0.rotate_left(8) ^ u64::from(byte);
+        }
+    }
+
+    fn write_u64(&mut self, hash: u64) {
+        self.0 = hash;
+    }
+}
+
+/// Hash table behind a large [`Index`], keyed by text with cached hashes.
+#[derive(Debug, Clone)]
+struct HashedIndex {
+    state: RandomState,
+    table: HashMap<HashedKey, NodeId, BuildHasherDefault<StoredHash>>,
+}
+
+impl HashedIndex {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            state: RandomState::new(),
+            table: HashMap::with_capacity_and_hasher(capacity, BuildHasherDefault::default()),
+        }
+    }
+
+    fn probe<'a>(&self, text: &'a str) -> Probe<'a> {
+        Probe {
+            hash: self.state.hash_one(text),
+            text,
+        }
+    }
+
+    fn get(&self, text: &str) -> Option<NodeId> {
+        let probe = self.probe(text);
+        let probe: &dyn KeyView = &probe;
+        self.table.get(probe).copied()
+    }
+
+    fn insert_first(&mut self, text: &Arc<str>, id: NodeId) -> Option<NodeId> {
+        let key = HashedKey {
+            hash: self.state.hash_one(&**text),
+            text: Arc::clone(text),
+        };
+        match self.table.entry(key) {
+            Entry::Occupied(entry) => Some(*entry.get()),
+            Entry::Vacant(entry) => {
+                entry.insert(id);
+                None
+            }
+        }
+    }
+
+    fn remove_if(&mut self, text: &str, id: NodeId) {
+        let probe = self.probe(text);
+        let probe: &dyn KeyView = &probe;
+        if self.table.get(probe) == Some(&id) {
+            self.table.remove(probe);
+        }
+    }
+
+    fn entries(&self) -> impl Iterator<Item = (&Arc<str>, NodeId)> {
+        self.table.iter().map(|(key, &id)| (&key.text, id))
+    }
+}
+
 /// Text index behind [`Children`], sized to the number of indexed children.
 #[derive(Debug, Clone)]
 enum Index {
     Linear(Vec<(Arc<str>, NodeId)>),
-    Hashed(Mapping),
+    Hashed(HashedIndex),
 }
 
 impl Index {
@@ -41,7 +197,7 @@ impl Index {
                 .iter()
                 .find(|(key, _)| key.as_ref() == text)
                 .map(|&(_, id)| id),
-            Self::Hashed(mapping) => mapping.get(text).copied(),
+            Self::Hashed(index) => index.get(text),
         }
     }
 
@@ -57,18 +213,15 @@ impl Index {
                     entries.push((Arc::clone(text), id));
                     return None;
                 }
-                let mut mapping: Mapping = entries.drain(..).collect();
-                mapping.insert(Arc::clone(text), id);
-                *self = Self::Hashed(mapping);
+                let mut index = HashedIndex::with_capacity(LINEAR_INDEX_MAX * 2);
+                for (key, existing) in entries.drain(..) {
+                    index.insert_first(&key, existing);
+                }
+                index.insert_first(text, id);
+                *self = Self::Hashed(index);
                 None
             }
-            Self::Hashed(mapping) => match mapping.entry(Arc::clone(text)) {
-                Entry::Occupied(entry) => Some(*entry.get()),
-                Entry::Vacant(entry) => {
-                    entry.insert(id);
-                    None
-                }
-            },
+            Self::Hashed(index) => index.insert_first(text, id),
         }
     }
 
@@ -83,18 +236,14 @@ impl Index {
                     entries.remove(position);
                 }
             }
-            Self::Hashed(mapping) => {
-                if mapping.get(text) == Some(&id) {
-                    mapping.remove(text);
-                }
-            }
+            Self::Hashed(index) => index.remove_if(text, id),
         }
     }
 
     fn keys(&self) -> Box<dyn Iterator<Item = &str> + '_> {
         match self {
             Self::Linear(entries) => Box::new(entries.iter().map(|(key, _)| key.as_ref())),
-            Self::Hashed(mapping) => Box::new(mapping.keys().map(Arc::as_ref)),
+            Self::Hashed(index) => Box::new(index.table.keys().map(|key| key.text.as_ref())),
         }
     }
 
@@ -104,21 +253,25 @@ impl Index {
             entries.extend(mapping);
             Self::Linear(entries)
         } else {
-            Self::Hashed(mapping)
+            let mut index = HashedIndex::with_capacity(mapping.len());
+            for (key, id) in &mapping {
+                index.insert_first(key, *id);
+            }
+            Self::Hashed(index)
         }
     }
 
     fn len(&self) -> usize {
         match self {
             Self::Linear(entries) => entries.len(),
-            Self::Hashed(mapping) => mapping.len(),
+            Self::Hashed(index) => index.table.len(),
         }
     }
 
     fn entries(&self) -> Box<dyn Iterator<Item = (&Arc<str>, NodeId)> + '_> {
         match self {
             Self::Linear(entries) => Box::new(entries.iter().map(|(key, id)| (key, *id))),
-            Self::Hashed(mapping) => Box::new(mapping.iter().map(|(key, id)| (key, *id))),
+            Self::Hashed(index) => Box::new(index.entries()),
         }
     }
 }
@@ -357,5 +510,40 @@ impl Children {
     /// Returns an iterator over all keys in the mapping.
     pub fn keys(&self) -> impl Iterator<Item = &str> {
         self.mapping.iter().flat_map(|index| index.keys())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stored_hash_uses_the_written_hash_and_folds_other_bytes() {
+        let mut hasher = StoredHash::default();
+        hasher.write_u64(0x1234);
+        assert_eq!(hasher.finish(), 0x1234);
+        let mut bytes = StoredHash::default();
+        bytes.write(&[1, 2]);
+        assert_eq!(bytes.finish(), 0x0102);
+    }
+
+    #[test]
+    fn hashed_keys_match_probes_by_hash_and_text() {
+        let index = HashedIndex::with_capacity(1);
+        let stored = HashedKey {
+            hash: index.state.hash_one("a"),
+            text: Arc::from("a"),
+        };
+        let probe = index.probe("a");
+        let as_view: &dyn KeyView = &probe;
+        let stored_view: &dyn KeyView = &stored;
+        assert!(as_view == stored_view);
+        let same_hash_other_text = Probe {
+            hash: stored.hash,
+            text: "b",
+        };
+        let other: &dyn KeyView = &same_hash_other_text;
+        assert!(other != stored_view);
+        assert_eq!(stored, stored.clone());
     }
 }
