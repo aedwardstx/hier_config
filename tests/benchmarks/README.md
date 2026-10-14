@@ -65,3 +65,10 @@ catches it deterministically. The layers are complementary, not redundant.
 Historical Phase 0 artifacts recording absolute pure-Python timings from one
 developer machine. They document the "before" state and are **not** used as a
 gate by anything. Do not wire CI to them.
+
+`test_perf_benchmark.py` uses the `pytest-benchmark` plugin, which is a dev
+dependency, so it runs in the normal environment:
+
+```bash
+uv run --no-sync pytest -m benchmark tests/benchmarks/test_perf_benchmark.py
+```

@@ -207,6 +207,8 @@ uv run --no-sync pytest -m benchmark -k test_parse_large_ios_config -v -s
 
 If a benchmark fails its time threshold, investigate the relevant code path for performance regressions.
 
+`tests/benchmarks/test_perf_benchmark.py` records statistical timings with the `pytest-benchmark` plugin, a dev dependency. It is historical and not a gate; see `tests/benchmarks/README.md`.
+
 The Rust core has a separate [Criterion](https://bheisler.github.io/criterion.rs/book/) suite in `crates/hier_config_core/benches/workflows.rs`. It times the same workloads natively, without Python overhead, and can save and compare baselines:
 
 ```bash

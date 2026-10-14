@@ -524,6 +524,10 @@ the three v3 negation rule models and their `HConfigDriverRules` fields,
   marshalling change above the ratio is about 1.05, and the test now
   alternates 30 samples of each call instead of taking the best of three, so
   noise cannot favour one side. The bound is unchanged. (#302)
+- `tests/benchmarks/test_perf_benchmark.py` errored because its
+  `pytest-benchmark` plugin was not installed. `pytest-benchmark` is now a dev
+  dependency, and the suite types its fixture with a local protocol because
+  the plugin ships no type information. (#302)
 - The release workflow now builds the Linux aarch64 wheel on a native arm64
   runner. Cross-compilation used an image whose toolchain is GCC 4.8.5, which
   cannot compile the bundled mimalloc allocator, so the v4.0.0b4 release

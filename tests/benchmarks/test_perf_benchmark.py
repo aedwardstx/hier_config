@@ -1,6 +1,5 @@
 """Committed pytest-benchmark suite for Phase 0 baseline recording."""
 
-# ruff: file-ignore[any-type]
 # pylint: disable=redefined-outer-name
 
 # The suite deliberately imports a private generator from the sibling
@@ -9,7 +8,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Protocol, TypeVar
 
 import pytest
 
@@ -17,7 +16,26 @@ from hier_config import get_hconfig
 from hier_config.models import Platform
 from tests.benchmarks.test_benchmarks import _generate_large_ios_config
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
 pytestmark = pytest.mark.benchmark
+
+_T = TypeVar("_T")
+
+
+class Benchmark(Protocol):
+    """The parts of the untyped pytest-benchmark `benchmark` fixture used here."""
+
+    def __call__(self, function: Callable[..., _T], /, *args: object) -> _T: ...
+
+    def pedantic(
+        self,
+        target: Callable[..., _T],
+        args: tuple[object, ...],
+        rounds: int,
+        iterations: int,
+    ) -> _T: ...
 
 
 @pytest.fixture(scope="session")
@@ -38,17 +56,17 @@ def ios_config_50k() -> str:
     return _generate_large_ios_config(num_interfaces=6000)
 
 
-def test_benchmark_parse_ios_1k(benchmark: Any, ios_config_1k: str) -> None:
+def test_benchmark_parse_ios_1k(benchmark: Benchmark, ios_config_1k: str) -> None:
     result = benchmark(get_hconfig, Platform.CISCO_IOS, ios_config_1k)
     assert len(result) > 0
 
 
-def test_benchmark_parse_ios_10k(benchmark: Any, ios_config_10k: str) -> None:
+def test_benchmark_parse_ios_10k(benchmark: Benchmark, ios_config_10k: str) -> None:
     result = benchmark(get_hconfig, Platform.CISCO_IOS, ios_config_10k)
     assert len(result) > 0
 
 
-def test_benchmark_parse_ios_50k(benchmark: Any, ios_config_50k: str) -> None:
+def test_benchmark_parse_ios_50k(benchmark: Benchmark, ios_config_50k: str) -> None:
     result = benchmark.pedantic(
         get_hconfig,
         args=(Platform.CISCO_IOS, ios_config_50k),
@@ -58,7 +76,7 @@ def test_benchmark_parse_ios_50k(benchmark: Any, ios_config_50k: str) -> None:
     assert len(result) > 0
 
 
-def test_benchmark_remediation_10k(benchmark: Any, ios_config_10k: str) -> None:
+def test_benchmark_remediation_10k(benchmark: Benchmark, ios_config_10k: str) -> None:
     running = get_hconfig(Platform.CISCO_IOS, ios_config_10k)
     generated_text = ios_config_10k.replace(
         " ip ospf cost 100", " ip ospf cost 200", 100
@@ -69,7 +87,7 @@ def test_benchmark_remediation_10k(benchmark: Any, ios_config_10k: str) -> None:
     assert len(remediation) > 0
 
 
-def test_benchmark_remediation_50k(benchmark: Any, ios_config_50k: str) -> None:
+def test_benchmark_remediation_50k(benchmark: Benchmark, ios_config_50k: str) -> None:
     running = get_hconfig(Platform.CISCO_IOS, ios_config_50k)
     generated_text = ios_config_50k.replace(
         " ip ospf cost 100", " ip ospf cost 200", 200
@@ -85,7 +103,7 @@ def test_benchmark_remediation_50k(benchmark: Any, ios_config_50k: str) -> None:
     assert len(remediation) > 0
 
 
-def test_benchmark_iteration_10k(benchmark: Any, ios_config_10k: str) -> None:
+def test_benchmark_iteration_10k(benchmark: Benchmark, ios_config_10k: str) -> None:
     config = get_hconfig(Platform.CISCO_IOS, ios_config_10k)
     nodes = benchmark(lambda: list(config.all_children_sorted()))
     assert len(nodes) > 0

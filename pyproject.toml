@@ -15,6 +15,7 @@ dev = [
     "pylint-pydantic",
     "pyright",
     "pytest",
+    "pytest-benchmark",
     "pytest-cov",
     "pytest-profiling",
     "pytest-xdist",
