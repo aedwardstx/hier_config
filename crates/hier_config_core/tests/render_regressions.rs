@@ -44,6 +44,53 @@ fn reference_dump(tree: &Tree) -> Vec<DumpLine> {
         .collect()
 }
 
+fn reference_unified_diff(source: &Tree, s: NodeId, target: &Tree, t: NodeId) -> Vec<String> {
+    let mut lines = Vec::new();
+    for child in source.arena[s].children.iter() {
+        let text = &source.arena[child].text;
+        if let Some(other) = target.arena[t].children.get(text) {
+            let nested = reference_unified_diff(source, child, target, other);
+            if !nested.is_empty() {
+                lines.push(format!("{}{}", source.indentation(child), text));
+                lines.extend(nested);
+            }
+        } else {
+            lines.push(format!("{}- {}", source.indentation(child), text));
+            for id in source.descendants_sorted(child) {
+                lines.push(format!(
+                    "{}- {}",
+                    source.indentation(id),
+                    source.arena[id].text
+                ));
+            }
+        }
+    }
+    for child in target.arena[t].children.iter() {
+        let text = &target.arena[child].text;
+        if !source.arena[s].children.contains(text) {
+            lines.push(format!("{}+ {}", target.indentation(child), text));
+            for id in target.descendants_sorted(child) {
+                lines.push(format!(
+                    "{}+ {}",
+                    target.indentation(id),
+                    target.arena[id].text
+                ));
+            }
+        }
+    }
+    lines
+}
+
+fn assert_unified_diff_matches_reference(source: &Tree, target: &Tree, label: &str) {
+    for (a, b) in [(source, target), (target, source)] {
+        assert_eq!(
+            a.unified_diff(b),
+            reference_unified_diff(a, a.root, b, b.root),
+            "{label}"
+        );
+    }
+}
+
 fn assert_renders_match_reference(tree: &Tree, label: &str) {
     for sectional_exiting in [false, true] {
         let mut expected = Vec::new();
@@ -88,6 +135,11 @@ fn corpus_renders_match_per_node_reference() {
                     && let Ok(delta) = tree.config_to_get_to(&target)
                 {
                     assert_renders_match_reference(&delta, &format!("{} delta", case.display()));
+                    assert_unified_diff_matches_reference(
+                        &tree,
+                        &target,
+                        &case.display().to_string(),
+                    );
                 }
                 checked += 1;
             }
@@ -128,5 +180,61 @@ fn renders_respect_order_weight_parent_level_exits_and_leaf_tags() {
             .map(String::as_str)
             .collect::<Vec<_>>(),
         ["a", "b", "c"]
+    );
+}
+
+#[test]
+fn unified_diff_handles_duplicates_reordering_and_order_weight() {
+    let mut source = Tree::from_str(
+        Platform::Generic,
+        "a\n  x\n  y\nb\n  y\nc\nd\n  keep\n    deep",
+    )
+    .unwrap();
+    let mut target = Tree::from_str(
+        Platform::Generic,
+        "b\n  y\n  z\na\n  x\nd\n  keep\n    deeper\ne\n  f\n    g",
+    )
+    .unwrap();
+    for tree in [&mut source, &mut target] {
+        let root = tree.root;
+        for text in ["a", "b"] {
+            let first = tree.arena[root].children.get(text).unwrap();
+            let duplicate = tree.create_child_unattached(root, text);
+            tree.add_child(duplicate, "dup only", true, false).unwrap();
+            let shared = std::sync::Arc::clone(&tree.arena[duplicate].text);
+            tree.arena[root].children.append(&shared, duplicate, false);
+            assert_eq!(tree.arena[root].children.get(text), Some(first));
+        }
+    }
+    let e = target.arena[target.root].children.get("e").unwrap();
+    let f = target.arena[e].children.get("f").unwrap();
+    let late = target.add_child(e, "early", true, false).unwrap();
+    target.arena[late].order_weight = -1;
+    target.arena[f].order_weight = 3;
+    assert_unified_diff_matches_reference(&source, &target, "duplicates");
+    // Duplicates compare against the first indexed sibling, so a self-diff of
+    // this tree is not empty; it must still match the reference.
+    assert_unified_diff_matches_reference(&target, &target, "self");
+    let lines = source.unified_diff(&target);
+    assert!(lines.contains(&"  + early".to_string()), "{lines:?}");
+}
+
+#[test]
+fn get_at_falls_back_when_texts_repeat_or_positions_shift() {
+    let mut tree = Tree::from_str(Platform::Generic, "a\nb\nc").unwrap();
+    let root = tree.root;
+    let a = tree.arena[root].children.get("a").unwrap();
+    let c = tree.arena[root].children.get("c").unwrap();
+    let children = &tree.arena[root].children;
+    assert_eq!(children.get_at(0, "a", &tree.arena), Some(a));
+    assert_eq!(children.get_at(0, "c", &tree.arena), Some(c));
+    assert_eq!(children.get_at(9, "c", &tree.arena), Some(c));
+    assert_eq!(children.get_at(1, "missing", &tree.arena), None);
+    let duplicate = tree.create_child_unattached(root, "a");
+    let shared = std::sync::Arc::clone(&tree.arena[duplicate].text);
+    tree.arena[root].children.append(&shared, duplicate, false);
+    assert_eq!(
+        tree.arena[root].children.get_at(3, "a", &tree.arena),
+        Some(a)
     );
 }

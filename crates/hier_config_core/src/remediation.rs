@@ -712,56 +712,87 @@ impl DiffTrees<'_> {
 
 /// Computes unified diff comparison lines between `source` and `target`.
 pub fn unified_diff(source: &Tree, target: &Tree) -> Vec<String> {
-    unified_diff_node(source, source.root, target, target.root)
+    let mut lines = Vec::new();
+    UnifiedDiff { source, target }.node(source.root, target.root, 1, &mut lines);
+    lines
 }
 
-fn unified_diff_node(
-    source: &Tree,
-    source_node: NodeId,
-    target: &Tree,
-    target_node: NodeId,
-) -> Vec<String> {
-    let mut lines = Vec::new();
+struct UnifiedDiff<'a> {
+    source: &'a Tree,
+    target: &'a Tree,
+}
 
-    // Elements in source
-    for self_child in source.arena[source_node].children.iter() {
-        let self_text = &source.arena[self_child].text;
-        if let Some(target_child) = target.arena[target_node].children.get(self_text) {
-            let child_diff = unified_diff_node(source, self_child, target, target_child);
-            if !child_diff.is_empty() {
-                lines.push(format!("{}{}", source.indentation(self_child), self_text));
-                lines.extend(child_diff);
+impl UnifiedDiff<'_> {
+    /// Appends the diff of the children of `source_node` and `target_node`, which
+    /// sit at `depth`, to `lines`.
+    fn node(
+        &self,
+        source_node: NodeId,
+        target_node: NodeId,
+        depth: usize,
+        lines: &mut Vec<String>,
+    ) {
+        let (source, target) = (self.source, self.target);
+        let source_children = &source.arena[source_node].children;
+        let target_children = &target.arena[target_node].children;
+        let source_indent = source.driver.rules.indentation * (depth - 1);
+        let target_indent = target.driver.rules.indentation * (depth - 1);
+
+        // Elements in source
+        for (position, self_child) in source_children.iter().enumerate() {
+            let self_text = &source.arena[self_child].text;
+            if let Some(target_child) = target_children.get_at(position, self_text, &target.arena) {
+                let start = lines.len();
+                self.node(self_child, target_child, depth + 1, lines);
+                if lines.len() > start {
+                    lines.insert(start, diff_line(source_indent, "", self_text));
+                }
+            } else {
+                lines.push(diff_line(source_indent, "- ", self_text));
+                push_subtree(source, self_child, depth + 1, "- ", lines);
             }
-        } else {
-            lines.push(format!("{}- {}", source.indentation(self_child), self_text));
-            for desc_id in source.descendants_sorted(self_child) {
-                lines.push(format!(
-                    "{}- {}",
-                    source.indentation(desc_id),
-                    source.arena[desc_id].text
-                ));
+        }
+
+        // Elements in target missing from source
+        for (position, target_child) in target_children.iter().enumerate() {
+            let target_text = &target.arena[target_child].text;
+            if source_children
+                .get_at(position, target_text, &source.arena)
+                .is_none()
+            {
+                lines.push(diff_line(target_indent, "+ ", target_text));
+                push_subtree(target, target_child, depth + 1, "+ ", lines);
             }
         }
     }
+}
 
-    // Elements in target missing from source
-    for target_child in target.arena[target_node].children.iter() {
-        let target_text = &target.arena[target_child].text;
-        if !source.arena[source_node].children.contains(target_text) {
-            lines.push(format!(
-                "{}+ {}",
-                target.indentation(target_child),
-                target_text
-            ));
-            for desc_id in target.descendants_sorted(target_child) {
-                lines.push(format!(
-                    "{}+ {}",
-                    target.indentation(desc_id),
-                    target.arena[desc_id].text
-                ));
-            }
-        }
+/// Appends every descendant of `node_id`, whose children sit at `depth`, in
+/// sorted pre-order with `marker`.
+fn push_subtree(tree: &Tree, node_id: NodeId, depth: usize, marker: &str, lines: &mut Vec<String>) {
+    let indentation = tree.driver.rules.indentation;
+    let children = tree.arena[node_id].children.as_slice();
+    let sorted;
+    let ordered = if tree.children_already_ordered(children) {
+        children
+    } else {
+        sorted = tree.sorted_children(node_id);
+        &sorted
+    };
+    for &child_id in ordered {
+        lines.push(diff_line(
+            indentation * (depth - 1),
+            marker,
+            &tree.arena[child_id].text,
+        ));
+        push_subtree(tree, child_id, depth + 1, marker, lines);
     }
+}
 
-    lines
+fn diff_line(width: usize, marker: &str, text: &str) -> String {
+    let mut line = String::with_capacity(width + marker.len() + text.len());
+    line.extend(std::iter::repeat_n(' ', width));
+    line.push_str(marker);
+    line.push_str(text);
+    line
 }

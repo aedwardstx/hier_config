@@ -190,6 +190,26 @@ impl Children {
         self.mapping.as_ref()?.get(text)
     }
 
+    /// Looks up a child by text like [`Self::get`], first checking the child at
+    /// `position`.
+    ///
+    /// Walks over two aligned configurations meet the same text at the same
+    /// position on both sides. When every child text here is distinct (the index
+    /// holds one entry per child), a positional match is necessarily the first
+    /// child with that text, so the hash lookup is skipped.
+    pub fn get_at(&self, position: usize, text: &str, arena: &Arena<Node>) -> Option<NodeId> {
+        if let Some(&id) = self.data.get(position)
+            && self
+                .mapping
+                .as_ref()
+                .is_some_and(|index| index.len() == self.data.len())
+            && arena.get(id).is_some_and(|node| node.text.as_ref() == text)
+        {
+            return Some(id);
+        }
+        self.get(text)
+    }
+
     /// Checks if a child with `text` exists.
     pub fn contains(&self, text: &str) -> bool {
         self.get(text).is_some()

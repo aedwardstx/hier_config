@@ -860,7 +860,7 @@ impl Tree {
     /// `order_weight` is left at its default on the overwhelming majority of nodes, so
     /// this lets the recursive walk iterate the existing slice instead of building and
     /// sorting a throwaway `Vec` at every level.
-    fn children_already_ordered(&self, children: &[NodeId]) -> bool {
+    pub(crate) fn children_already_ordered(&self, children: &[NodeId]) -> bool {
         let mut previous = i32::MIN;
         for &id in children {
             let weight = self.arena.get(id).map_or(0, |n| n.order_weight);
