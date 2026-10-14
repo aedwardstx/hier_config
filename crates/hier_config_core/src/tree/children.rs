@@ -2,6 +2,7 @@ use crate::arena::{Arena, NodeId};
 use crate::tree::node::Node;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::Arc;
 
 /// Text-keyed index from a child's text to the *first* child that carries it.
@@ -94,6 +95,30 @@ impl Children {
                 .get_or_insert_with(|| Box::new(Mapping::default()))
                 .entry(Arc::clone(text))
                 .or_insert(child_id);
+        }
+    }
+
+    /// Appends a child unless one with `text` is already indexed, hashing `text` once.
+    ///
+    /// `insert` creates the child only when the text is new; otherwise the existing
+    /// child's id is returned as the error and nothing is modified.
+    pub(crate) fn append_unique(
+        &mut self,
+        text: &Arc<str>,
+        insert: impl FnOnce() -> NodeId,
+    ) -> Result<NodeId, NodeId> {
+        match self
+            .mapping
+            .get_or_insert_with(|| Box::new(Mapping::default()))
+            .entry(Arc::clone(text))
+        {
+            Entry::Occupied(existing) => Err(*existing.get()),
+            Entry::Vacant(slot) => {
+                let child_id = insert();
+                slot.insert(child_id);
+                self.data.push(child_id);
+                Ok(child_id)
+            }
         }
     }
 

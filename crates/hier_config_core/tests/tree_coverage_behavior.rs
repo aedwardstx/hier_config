@@ -786,3 +786,23 @@ fn shallow_copies_keep_tag_semantics_without_allocating_empty_extras() {
     assert_eq!(dst.arena[merged_leaf].tags(), &tags(&["t"]));
     assert_eq!(dst.arena[merged_leaf].instances()[0].tags, tags(&["t"]));
 }
+
+#[test]
+fn rejected_duplicates_leave_arena_and_index_untouched() {
+    let mut tree = Tree::default();
+    let root = tree.root;
+    let first = add(&mut tree, root, "first");
+    let before = tree.clone();
+    let nodes = tree.arena.len();
+    assert!(matches!(
+        tree.add_child(root, " first ", true, false),
+        Err(TreeError::DuplicateChild(_))
+    ));
+    assert_eq!(tree.arena.len(), nodes);
+    assert_eq!(tree, before);
+    assert_eq!(tree.get_child_by_text(root, "first"), Some(first));
+    let second = add(&mut tree, root, "second");
+    let mut expected = before;
+    assert_eq!(add(&mut expected, root, "second"), second);
+    assert_eq!(tree.arena[second].real_indent_level, 0);
+}

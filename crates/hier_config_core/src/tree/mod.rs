@@ -331,13 +331,37 @@ impl Tree {
             return Err(TreeError::MaxDepthExceeded(MAX_TREE_DEPTH));
         }
 
-        if check_if_present && let Some(existing_id) = self.arena[parent_id].children.get(trimmed) {
+        let parent_real_indent = self.arena[parent_id].real_indent_level;
+        let new_node = |shared: &Arc<str>| {
+            let mut node = Node::from_shared_text(Arc::clone(shared), Some(parent_id));
+            node.real_indent_level = parent_real_indent + 1;
+            node
+        };
+
+        let existing_id = if !check_if_present {
+            None
+        } else if return_if_present {
+            // Callers asking for the existing child usually find it, so look it up
+            // without first building the shared text a new child would need.
+            self.arena[parent_id].children.get(trimmed)
+        } else {
+            // A new child is the common case here (every parsed line), so probe and
+            // insert with a single hash of the text.
+            let shared: Arc<str> = Arc::from(trimmed);
+            let mut children = std::mem::take(&mut self.arena[parent_id].children);
+            let arena = &mut self.arena;
+            let inserted = children.append_unique(&shared, || arena.insert(new_node(&shared)));
+            self.arena[parent_id].children = children;
+            match inserted {
+                Ok(child_id) => return Ok(child_id),
+                Err(existing_id) => Some(existing_id),
+            }
+        };
+
+        if let Some(existing_id) = existing_id {
             if self.is_duplicate_child_allowed(parent_id) {
                 let shared: Arc<str> = Arc::from(trimmed);
-                let mut node = Node::from_shared_text(Arc::clone(&shared), Some(parent_id));
-                let parent_real_indent = self.arena[parent_id].real_indent_level;
-                node.real_indent_level = parent_real_indent + 1;
-                let child_id = self.arena.insert(node);
+                let child_id = self.arena.insert(new_node(&shared));
                 self.arena[parent_id]
                     .children
                     .append(&shared, child_id, false);
@@ -352,10 +376,7 @@ impl Tree {
         }
 
         let shared: Arc<str> = Arc::from(trimmed);
-        let mut node = Node::from_shared_text(Arc::clone(&shared), Some(parent_id));
-        let parent_real_indent = self.arena[parent_id].real_indent_level;
-        node.real_indent_level = parent_real_indent + 1;
-        let child_id = self.arena.insert(node);
+        let child_id = self.arena.insert(new_node(&shared));
         self.arena[parent_id]
             .children
             .append(&shared, child_id, true);
