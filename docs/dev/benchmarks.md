@@ -600,6 +600,51 @@ Caveats:
   Python object allocation, garbage-collector tracking and dictionary inserts
   at the binding boundary.
 
+### Pass 7 follow-up: `from_lines` marshalling
+
+`HConfig.from_lines()` took 1.16–1.18x as long as `HConfig.from_text()` on the
+same config, which made `test_fast_load_vs_get_hconfig` (bound: 1.1x) fail
+intermittently. The core fast-load loop was not the problem: natively it was
+already slightly faster than the full parser. The extra time was in moving the
+lines across the boundary:
+
+- The Python constructor split a `str` into Python strings and copied every
+  list or tuple with `list()`. Now a `str` goes to the binding unchanged and is
+  split in Rust on exactly the `str.splitlines()` boundaries, and an exact
+  `list` or `tuple` is passed as-is. Other iterables, including list
+  subclasses that override `__iter__`, are still materialised with `list()`.
+- The binding copied each line into one buffer before releasing the GIL. It now
+  holds a `PyBackedStr` per line, which keeps the Python string alive and
+  borrows its UTF-8 data, so the parse still runs without the GIL but without
+  the copy. The references are dropped after the GIL is re-acquired.
+- The fast-load loop scanned each line's leading whitespace three times with
+  Unicode-aware trims. It now scans once, using the ASCII fast path of the
+  indentation helper, and reuses the result unless a `per_line_sub` rule
+  rewrote the line.
+
+Python end-to-end: release wheels of the previous commit and this change in two
+CPython 3.14.4 virtual environments, three alternated rounds of best-of-200 on
+the 10k-line IOS benchmark config. The table shows the median round. Rounds
+agreed to within 3%.
+
+| Operation | Before | After | Time reduction |
+|---|---:|---:|---:|
+| `from_text` (reference) | 0.772 ms | 0.778 ms | −1% (noise) |
+| `from_lines` (tuple) | 0.910 ms | 0.820 ms | 10% |
+| `from_lines` (list) | 0.899 ms | 0.825 ms | 8% |
+| `from_lines` (str) | 1.103 ms | 0.759 ms | 31% |
+| `from_lines` (generator) | 1.003 ms | 0.938 ms | 6% |
+| `from_lines` / `from_text` (tuple) | 1.17x | 1.05x | |
+
+Native Criterion `parse/fast_load_ios_10k`, three alternated rounds: 0.973–0.984
+ms before and 0.950–0.960 ms after (about 3%). `get_hconfig_fast_load()` with a
+`str`, as used by the CI gate, fell from 0.169 to 0.109–0.113 calibration units.
+
+Limits: a tuple or list still pays a few Python C-API calls per line (item
+access, type check and `PyUnicode_AsUTF8AndSize`), about 60 µs for 8,400 lines,
+so `from_lines()` on a pre-split sequence remains slightly slower than
+`from_text()` on the joined text. Passing the text as a `str` avoids that cost.
+
 ---
 
 ## Performance Guardrails in CI
@@ -644,15 +689,17 @@ claiming cross-platform calibration.
 
 The CI regression suite asserts upper bounds (`MAX_COST_UNITS`) against
 a 400-interface configuration. The following figures are the range over two
-local runs after Pass 7 (Apple M2 Max, CPython 3.14.4, 1 unit ≈ 3.05 ms); current
-code and CI logs are authoritative:
+local runs after Pass 7 (Apple M2 Max, CPython 3.14.4, 1 unit ≈ 3.05 ms). The
+`fast_load` row was re-measured after the
+[`from_lines` marshalling change](#pass-7-follow-up-from_lines-marshalling)
+(1 unit ≈ 3.20 ms in those runs). Current code and CI logs are authoritative:
 
 | Operation | Observed 4.0 Cost | CI Ceiling (`MAX_COST_UNITS`) | Safety Margin |
 |---|---:|---:|---|
 | **`deepcopy`** | **0.014–0.015 units** (0.05 ms) | 0.030 units | 2.0x |
 | **`iteration`** | **0.037 units** (0.11–0.12 ms) | 0.060 units | 1.6x |
 | **`remediation`** | **0.070–0.071 units** (0.21–0.22 ms) | 0.190 units | 2.7x |
-| **`fast_load`** | **0.169 units** (0.51–0.53 ms) | 0.240 units | 1.4x |
+| **`fast_load`** | **0.109–0.113 units** (0.35–0.36 ms) | 0.240 units | 2.1x |
 | **`parse`** | **0.114–0.119 units** (0.35–0.36 ms) | 0.240 units | 2.0x |
 | **`dump`** | **0.297–0.307 units** (0.91–0.95 ms) | 0.450 units | 1.5x |
 

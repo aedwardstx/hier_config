@@ -6,8 +6,10 @@ core, so their unit coverage lives in ``crates/hier_config_core/src/parser.rs``
 tests below still exercise those paths through the public loader.
 """
 
+from collections.abc import Iterator
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from typing import cast
 
 import pytest
 
@@ -458,3 +460,60 @@ def test_dump_round_trip_is_idempotent_for_collapsed_vlan_list() -> None:
 
     again = HConfig.from_dump(Platform.CISCO_IOS, restored.dump())
     assert tuple(child.text for child in again.all_children()) == original
+
+
+_SPLITLINES_TEXT = (
+    "hostname a\rinterface b\u2028 description c\x0bntp server d\x85"
+    "vlan e\r\n name f\x0cvlan g\x1c\x1d\x1e\u2029snmp h\n"
+)
+
+
+def test_from_lines_str_splits_on_every_str_splitlines_boundary() -> None:
+    """A str given to from_lines splits exactly as ``str.splitlines()`` does."""
+    from_str = HConfig.from_lines(Platform.CISCO_IOS, _SPLITLINES_TEXT)
+    from_list = HConfig.from_lines(Platform.CISCO_IOS, _SPLITLINES_TEXT.splitlines())
+    assert from_str.dump_simple() == from_list.dump_simple()
+    assert from_str.get_child(equals="vlan e") is not None
+
+
+def test_from_lines_accepts_every_sequence_and_iterable_form() -> None:
+    """Lists, tuples, generators and str subclasses load identically."""
+    lines = ["interface a", " description é", "hostname r1"]
+    expected = HConfig.from_lines(Platform.CISCO_IOS, lines).dump_simple()
+
+    class _Text(str):  # ruff: ignore[subclass-builtin] - the subclass is the input under test
+        __slots__ = ()
+
+    for form in (
+        tuple(lines),
+        (line for line in lines),
+        _Text("\n".join(lines)),
+    ):
+        assert HConfig.from_lines(Platform.CISCO_IOS, form).dump_simple() == expected
+
+
+def test_from_lines_honours_list_subclass_iteration() -> None:
+    """A list subclass overriding ``__iter__`` is iterated, not indexed."""
+
+    class _Reversed(list[str]):  # ruff: ignore[subclass-builtin] - the subclass is the input under test
+        def __iter__(self) -> Iterator[str]:
+            return reversed(self)
+
+    config = HConfig.from_lines(
+        Platform.CISCO_IOS, _Reversed([" description d", "interface a"])
+    )
+    assert config.dump_simple() == ("interface a", "  description d")
+
+
+def test_from_lines_keeps_embedded_newlines_inside_one_line() -> None:
+    """Sequence items are lines as given; an embedded newline is not a split."""
+    config = HConfig.from_lines(Platform.GENERIC, ["banner a\nb", "hostname r1"])
+    assert config.dump_simple() == ("banner a b", "hostname r1")
+
+
+def test_from_lines_rejects_non_str_items() -> None:
+    """Every item must be a str."""
+    # Deliberately mistyped input, as an untyped caller could pass.
+    lines = cast("list[str]", ["hostname r1", 3])
+    with pytest.raises(TypeError):
+        HConfig.from_lines(Platform.CISCO_IOS, lines)

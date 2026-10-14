@@ -245,6 +245,14 @@ v4 design decisions, for the record:
 
 ### Changed
 
+- `HConfig.from_lines()` (and `get_hconfig_fast_load()`) marshals input with
+  less overhead. A `str` is split natively on the `str.splitlines()`
+  boundaries instead of being split into Python strings first; lists and
+  tuples are no longer copied with `list()`; and line text is borrowed from
+  the Python strings rather than copied, with the GIL still released for the
+  parse. The fast-load loop also scans each line's indentation once. On a
+  10k-line IOS config this cuts `from_lines()` from 0.91 to 0.82 ms for a
+  tuple and from 1.10 to 0.76 ms for a `str`. (#302)
 - Line splitting jumps straight to the first candidate byte of each
   eight-byte word instead of re-scanning it byte by byte, cutting
   `splitlines()` time by roughly a third on IOS and XR configurations
@@ -511,6 +519,11 @@ the three v3 negation rule models and their `HConfigDriverRules` fields,
 
 ### Fixed
 
+- `test_fast_load_vs_get_hconfig` failed intermittently because `from_lines()`
+  ran 1.16–1.18x as long as `from_text()` against a 1.1x bound. After the
+  marshalling change above the ratio is about 1.05, and the test now
+  alternates 30 samples of each call instead of taking the best of three, so
+  noise cannot favour one side. The bound is unchanged. (#302)
 - The release workflow now builds the Linux aarch64 wheel on a native arm64
   runner. Cross-compilation used an image whose toolchain is GCC 4.8.5, which
   cannot compile the bundled mimalloc allocator, so the v4.0.0b4 release

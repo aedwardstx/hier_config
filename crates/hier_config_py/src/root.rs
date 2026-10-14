@@ -7,6 +7,7 @@ use hier_config_core::models::{Dump, DumpLine};
 use hier_config_core::{Platform, Tree};
 use pyo3::IntoPyObjectExt;
 use pyo3::prelude::*;
+use pyo3::pybacked::PyBackedStr;
 use pyo3::types::{PyDict, PyFrozenSet, PyList, PySet, PyString, PyTuple, PyType};
 use pyo3::{PyTraverseError, PyVisit};
 
@@ -454,8 +455,9 @@ impl PyHConfig {
     /// Mirrors [`Self::_load_native`] but applies only `per_line_sub` rules, matching
     /// the semantics of `get_hconfig_fast_load`.
     ///
-    /// `lines` may be a single `str` — which is split on line boundaries in Rust,
-    /// avoiding any per-line marshalling — or any iterable of `str`.
+    /// `lines` may be a single `str` — which is split in Rust on the same
+    /// boundaries as `str.splitlines()`, avoiding any per-line marshalling — or any
+    /// iterable of `str`.
     ///
     /// # Errors
     ///
@@ -472,22 +474,15 @@ impl PyHConfig {
         let base: &PyHConfigBase = slf.as_ref();
         let shared = Arc::clone(&base.tree);
 
-        // The parse runs without the GIL, so the text has to be copied out of Python
-        // memory first.
-        let (buf, spans) = if let Ok(text) = lines.cast::<PyString>() {
-            // A single string only needs one copy; splitting happens Rust-side.
-            (text.to_str()?.to_owned(), None)
+        // `PyBackedStr` keeps each Python string alive and borrows its UTF-8 data, so
+        // the parse can run without the GIL and without copying the text out first.
+        let (backed, split_text) = if let Ok(text) = lines.cast::<PyString>() {
+            // A single string is split Rust-side, avoiding any per-line marshalling.
+            (vec![PyBackedStr::try_from(text.clone())?], true)
         } else {
-            // For a sequence, pack every line into one contiguous buffer plus offsets
-            // rather than a Vec<String>: a large config is tens of thousands of lines,
-            // and one allocation beats one per line. Offsets rather than a joined
-            // string keep lines that themselves contain a newline intact.
-            let mut buf = String::new();
-            let mut spans: Vec<(usize, usize)> = Vec::new();
-            let mut push = |line: &Bound<'_, PyAny>| -> PyResult<()> {
-                let start = buf.len();
-                buf.push_str(line.cast::<PyString>()?.to_str()?);
-                spans.push((start, buf.len()));
+            let mut backed = Vec::with_capacity(lines.len().unwrap_or(0));
+            let mut push = |line: Bound<'_, PyAny>| -> PyResult<()> {
+                backed.push(PyBackedStr::try_from(line.cast_into::<PyString>()?)?);
                 Ok(())
             };
             // A list or tuple is by far the common case and can be walked by index,
@@ -495,29 +490,40 @@ impl PyHConfig {
             // per line.
             if let Ok(list) = lines.cast::<PyList>() {
                 for line in list {
-                    push(&line)?;
+                    push(line)?;
                 }
             } else if let Ok(tuple) = lines.cast::<PyTuple>() {
                 for line in tuple {
-                    push(&line)?;
+                    push(line)?;
                 }
             } else {
                 for line in lines.try_iter()? {
-                    push(&line?)?;
+                    push(line?)?;
                 }
             }
-            (buf, Some(spans))
+            (backed, false)
         };
 
-        py.detach(move || {
-            let borrowed: Vec<&str> = match &spans {
-                Some(spans) => spans.iter().map(|&(s, e)| &buf[s..e]).collect(),
-                None => buf.lines().collect(),
+        let (result, backed) = py.detach(move || {
+            let borrowed: Vec<&str> = if split_text {
+                backed
+                    .iter()
+                    .flat_map(|text| hier_config_core::parser::splitlines(text))
+                    .collect()
+            } else {
+                backed.iter().map(|line| &**line).collect()
             };
-            let mut tree = shared.tree.write_py()?;
-            hier_config_core::parser::load_fast(&mut tree, &borrowed, run_post_load)
-                .map_err(to_py_err)
-        })
+            let result = shared.tree.write_py().and_then(|mut tree| {
+                hier_config_core::parser::load_fast(&mut tree, &borrowed, run_post_load)
+                    .map_err(to_py_err)
+            });
+            drop(borrowed);
+            (result, backed)
+        });
+        // Released here, with the GIL held, so the references are dropped directly
+        // rather than queued for a later decref.
+        drop(backed);
+        result
     }
 
     /// Reads and parses an on-disk config file into this tree inside a single FFI call.

@@ -219,9 +219,14 @@ def hconfig_from_lines(
     core_ran = _core_runs_post_load(driver)
     if isinstance(lines, str):
         _reject_structured_format(lines)
-        lines = lines.splitlines()
+        # The native loader splits on exactly the `str.splitlines()` boundaries.
+        lines = str(lines)
+    elif type(lines) not in {list, tuple}:
+        # Exact types only: a subclass may override iteration, which the native
+        # loader's indexed walk would bypass.
+        lines = list(lines)
 
-    config._load_fast_native(list(lines), core_ran)  # ruff: ignore[private-member-access]
+    config._load_fast_native(lines, core_ran)  # ruff: ignore[private-member-access]
 
     _run_post_load_callbacks(config, driver, core_ran=core_ran)
 

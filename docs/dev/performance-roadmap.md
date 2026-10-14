@@ -11,7 +11,7 @@ This document records what is *left* to do. It lists the remaining optimisations
 
 ## Current baseline
 
-Reference figures on an Apple M2 Max, release build (`maturin develop --release`), against the generated 400-interface Cisco IOS config used by the gate. Costs are in **calibration units**, which self-normalise across machines (1 unit ≈ 3.05 ms on this machine, CPython 3.14.4). The figures below are the range over two runs after Pass 7 (see [Performance & Benchmarks](benchmarks.md#pass-7-lazy-deltas-single-walk-rendering-and-cheaper-copies)).
+Reference figures on an Apple M2 Max, release build (`maturin develop --release`), against the generated 400-interface Cisco IOS config used by the gate. Costs are in **calibration units**, which self-normalise across machines (1 unit ≈ 3.05 ms on this machine, CPython 3.14.4). The figures below are the range over two runs after Pass 7 (see [Performance & Benchmarks](benchmarks.md#pass-7-lazy-deltas-single-walk-rendering-and-cheaper-copies)); `fast_load` was re-measured after [item 16](#16-cheaper-line-marshalling-in-from_lines), when 1 unit ≈ 3.20 ms.
 
 | Operation | Cost (units) | Wall clock | Gate ceiling | Remaining headroom |
 |---|---:|---:|---:|---|
@@ -19,7 +19,7 @@ Reference figures on an Apple M2 Max, release build (`maturin develop --release`
 | `iteration` | 0.037 | 0.11–0.12 ms | 0.06 | ~0.011 units, via [item 2](#2-expose-a-bulkcolumnar-accessor) |
 | `remediation` | 0.070–0.071 | 0.21–0.22 ms | 0.19 | item 5; [item 6](#6-replace-siphash-in-the-children-index-with-a-seeded-fast-hasher); item 7 |
 | `parse` | 0.114–0.119 | 0.35–0.36 ms | 0.24 | item 5; [item 14](#14-cheaper-per_line_sub-substitutions-while-parsing); items 6 and 7; see also [items 3](#3-store-node-text-without-a-per-node-allocation) and [4](#4-simd-byte-scans-in-the-parser) |
-| `fast_load` | 0.169 | 0.51–0.53 ms | 0.24 | [Item 16](#16-cheaper-line-marshalling-in-from_lines); items 5–7 apply |
+| `fast_load` | 0.109–0.113 | 0.35–0.36 ms | 0.24 | Item 16 is done; items 5–7 apply |
 | `dump` | 0.297–0.307 | 0.91–0.95 ms | 0.45 | ~45%, via [item 1](#1-change-dumpline-from-a-pydantic-model-to-a-__slots__-class) |
 
 Re-derive these with `pytest -m benchmark tests/benchmarks/test_perf_regression.py -v -s` rather than trusting any number written down here. The headroom percentages for items 5–7 were measured before Pass 7 and are separate measurements. They overlap, so do not add them together (see [Realistic ceiling](#realistic-ceiling)). The gate ceilings were not tightened after Pass 7, because no Linux CI measurements were available to calibrate them against.
@@ -448,13 +448,15 @@ Each option must keep the substitution order and results identical, including fo
 
 ## 16. Cheaper line marshalling in `from_lines`
 
-**Gain:** small. `HConfig.from_lines()` (also behind `get_hconfig_fast_load`) takes about 1.16–1.20x as long as `HConfig.from_text()` on the same 10k-line config, before and after Pass 7.
+**Gain:** realised. On the 10k-line IOS config `HConfig.from_lines()` fell from 0.91 to 0.82 ms for a tuple and from 1.10 to 0.76 ms for a `str`; its ratio to `HConfig.from_text()` fell from 1.17x to 1.05x. See [Pass 7 follow-up](benchmarks.md#pass-7-follow-up-from_lines-marshalling).
 **Cost:** internal only.
-**Status:** not taken.
+**Status:** done.
 
-The binding copies every Python `str` into one buffer with offsets, and the Python constructor first copies the input with `list(lines)`. A profile shows `PyUnicode_AsUTF8AndSize`, the list iterator and `memmove` from buffer growth. Pre-sizing the buffer with a separate length pass was measured and was **slower** (from_lines 0.92 ms to 1.00 ms), because the extra pass costs more than the reallocations it saves. Avoiding the `list()` copy for tuples and lists is the next thing to try.
+A `str` is now split natively on the `str.splitlines()` boundaries, an exact `list` or `tuple` is passed without a `list()` copy, and the binding borrows each line through `PyBackedStr` instead of copying it into a buffer. The fast-load loop also scans indentation once per line. Pre-sizing the old copy buffer with a separate length pass had been measured first and was slower (0.92 to 1.00 ms).
 
-`test_fast_load_vs_get_hconfig` in `tests/benchmarks/test_benchmarks.py` asserts that `from_lines` is no slower than 1.1x `from_text`. That bound is already exceeded on this machine (it fails intermittently with or without Pass 7), so revisit the bound or the marshalling before relying on that test.
+What remains: a tuple or list still costs a few C-API calls per line (item access, type check, `PyUnicode_AsUTF8AndSize`), about 60 µs for 8,400 lines, so `from_lines()` on a sequence stays slightly slower than `from_text()` on the joined text. Removing that would need direct access to the tuple's item array or the string data, which the stable ABI does not offer. `_load_native` (behind `from_text`) still copies the whole text with `to_owned` before releasing the GIL; `PyBackedStr` would avoid that copy too, worth about 1–2% of a 10k-line parse, not yet measured.
+
+`test_fast_load_vs_get_hconfig` now alternates 30 samples of each call and passed 40 of 40 runs locally with the 1.1x bound unchanged.
 
 ---
 

@@ -942,8 +942,9 @@ class HConfig(HConfigBase):
         Mirrors [`Self::_load_native`] but applies only `per_line_sub` rules, matching
         the semantics of `get_hconfig_fast_load`.
 
-        `lines` may be a single `str` — which is split on line boundaries in Rust,
-        avoiding any per-line marshalling — or any iterable of `str`.
+        `lines` may be a single `str` — which is split in Rust on the same
+        boundaries as `str.splitlines()`, avoiding any per-line marshalling — or any
+        iterable of `str`.
 
         # Errors
 

@@ -678,19 +678,24 @@ pub fn load_fast(tree: &mut Tree, lines: &[&str], run_post_load: bool) -> Result
     tree.arena.reserve(lines.len());
 
     for original_line in lines {
-        let trimmed_left = original_line.trim_start();
-        if trimmed_left.is_empty() {
+        // One indentation scan per line: it doubles as the blank-line check, and is
+        // reused unless a substitution actually rewrote the line.
+        let original_indent = leading_whitespace_len(original_line);
+        if original_indent == original_line.len() {
             continue;
         }
 
         let processed_line = per_line_subs.apply(original_line);
-
-        let processed_trimmed = processed_line.trim_start();
+        let indent_len = match &processed_line {
+            Cow::Borrowed(_) => original_indent,
+            Cow::Owned(rewritten) => leading_whitespace_len(rewritten),
+        };
+        let processed_trimmed = &processed_line[indent_len..];
         if processed_trimmed.is_empty() {
             continue;
         }
 
-        let indent = i32::try_from(leading_whitespace_len(&processed_line)).unwrap_or(i32::MAX);
+        let indent = i32::try_from(indent_len).unwrap_or(i32::MAX);
 
         // Mirrors the full parser: lines that already have single-space separators and
         // no trailing whitespace — nearly all of them — are borrowed as-is instead of
@@ -852,6 +857,54 @@ pub fn from_dump(driver: Driver, dump: &Dump) -> Result<Tree, TreeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn load_fast_skips_blank_lines_and_indents_after_per_line_subs() {
+        let mut driver = Driver::default();
+        driver.rules.per_line_sub = vec![
+            crate::models::PerLineSubRule {
+                search: "^drop.*".to_owned(),
+                replace: "   ".to_owned(),
+            },
+            crate::models::PerLineSubRule {
+                search: "^NEST ".to_owned(),
+                replace: "  ".to_owned(),
+            },
+        ];
+        let lines = [
+            "interface a",
+            "",
+            "   ",
+            "\t\u{a0}\u{2028}",
+            "drop me",
+            "NEST description  two   spaces ",
+            "\u{a0}shutdown",
+            "\u{3000}mtu 9000",
+            "interface b",
+            "\tdescription tabbed",
+        ];
+        let mut tree = Tree::new(driver);
+        load_fast(&mut tree, &lines, false).unwrap();
+        assert_eq!(
+            tree.dump_simple(false),
+            [
+                "interface a",
+                "  description two spaces",
+                "  shutdown",
+                "    mtu 9000",
+                "interface b",
+                "  description tabbed",
+            ]
+        );
+        let root = &tree.arena[tree.root];
+        let first = root.children.iter().next().unwrap();
+        let indents: Vec<i32> = tree.arena[first]
+            .children
+            .iter()
+            .map(|child| tree.arena[child].real_indent_level)
+            .collect();
+        assert_eq!(indents, [2, 2]);
+    }
 
     #[test]
     fn word_at_a_time_normalization_check_matches_the_byte_scan() {

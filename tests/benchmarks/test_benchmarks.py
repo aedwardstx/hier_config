@@ -148,6 +148,23 @@ def _time_fn(fn: Callable[[], object], iterations: int = 3) -> float:
     return best
 
 
+def _time_pair(
+    first: Callable[[], object],
+    second: Callable[[], object],
+    iterations: int = 30,
+) -> tuple[float, float]:
+    """Return the best elapsed time in seconds of each function, sampled alternately.
+
+    A sub-millisecond call needs many samples for its minimum to be stable, and
+    alternating the two keeps machine-wide drift from favouring either one.
+    """
+    best_first = best_second = float("inf")
+    for _ in range(iterations):
+        best_first = min(best_first, _time_fn(first, iterations=1))
+        best_second = min(best_second, _time_fn(second, iterations=1))
+    return best_first, best_second
+
+
 class TestParsingBenchmarks:
     """Benchmarks for config parsing."""
 
@@ -186,8 +203,8 @@ class TestParsingBenchmarks:
         config_text = _generate_large_ios_config()
         config_lines = tuple(config_text.splitlines())
 
-        time_full = _time_fn(lambda: HConfig.from_text(Platform.CISCO_IOS, config_text))
-        time_fast = _time_fn(
+        time_full, time_fast = _time_pair(
+            lambda: HConfig.from_text(Platform.CISCO_IOS, config_text),
             lambda: HConfig.from_lines(Platform.CISCO_IOS, config_lines),
         )
         ratio = time_full / time_fast if time_fast > 0 else float("inf")
