@@ -418,31 +418,33 @@ impl Tree {
             .ok_or(TreeError::NodeNotFound(source_id))?;
         let new_id = self.add_child(parent_id, &src_node.text, true, merged)?;
 
-        let (order_weight, comments, is_leaf, tags, instances) = {
-            (
-                src_node.order_weight,
-                src_node.comments().clone(),
-                src_node.is_leaf(),
-                source_tree.tags(source_id),
-                if merged {
-                    vec![Instance {
-                        id: u64::from(source_id.index),
-                        comments: src_node.comments().clone(),
-                        tags: source_tree.tags(source_id),
-                    }]
-                } else {
-                    Vec::new()
-                },
-            )
+        let is_leaf = src_node.is_leaf();
+        // The recursive tag union is only needed for a leaf's own tags or a merge
+        // instance; branches never store it, so skip the subtree walk otherwise.
+        let tags = if is_leaf || merged {
+            source_tree.tags(source_id)
+        } else {
+            BTreeSet::new()
         };
+        let instance = merged.then(|| Instance {
+            id: u64::from(source_id.index),
+            comments: src_node.comments().clone(),
+            tags: tags.clone(),
+        });
+        let order_weight = src_node.order_weight;
+        let comments = src_node.comments().clone();
 
         let target_node = &mut self.arena[new_id];
         target_node.order_weight = order_weight;
-        target_node.comments_mut().extend(comments);
-        if merged {
-            target_node.instances_mut().extend(instances);
+        // Empty writes would allocate an extras block for nothing; `Node`
+        // equality and serialisation treat both representations alike.
+        if !comments.is_empty() {
+            target_node.comments_mut().extend(comments);
         }
-        if is_leaf {
+        if let Some(instance) = instance {
+            target_node.instances_mut().push(instance);
+        }
+        if is_leaf && !tags.is_empty() {
             target_node.tags_mut().extend(tags);
         }
 
@@ -621,6 +623,29 @@ impl Tree {
             let mut parent_children = std::mem::take(&mut self.arena[parent_id].children);
             parent_children.delete_by_id(child_id, &self.arena);
             self.arena[parent_id].children = parent_children;
+        }
+        self.delete_subtree(child_id);
+    }
+
+    /// Deletes a child that was just appended, without rebuilding its parent's index.
+    ///
+    /// The remediation and difference algorithms add a scratch child per matched
+    /// section and drop it again when it collects nothing; going through
+    /// [`Self::delete_child`] rehashed every sibling each time, which made those
+    /// passes quadratic in the number of top-level sections. Falls back to
+    /// `delete_child` when the node is not its parent's trailing child.
+    pub(crate) fn discard_last_child(&mut self, child_id: NodeId) {
+        if child_id == self.root || !self.arena.contains(child_id) {
+            return;
+        }
+        if let Some(parent_id) = self.arena[child_id].parent
+            && self.arena.contains(parent_id)
+        {
+            let text = Arc::clone(&self.arena[child_id].text);
+            if !self.arena[parent_id].children.pop_if_last(child_id, &text) {
+                self.delete_child(child_id);
+                return;
+            }
         }
         self.delete_subtree(child_id);
     }
@@ -1821,6 +1846,74 @@ impl Iterator for DescendantsSorted<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Builds the same tree twice, discarding the trailing child via the O(1)
+    /// path in one and the general `delete_child` path in the other, and checks
+    /// the resulting children (order and text index) are identical.
+    fn assert_discard_matches_delete(texts: &[&str], dup_root_rule: bool) {
+        let build = || {
+            let mut tree = Tree::for_platform(Platform::Generic);
+            if dup_root_rule {
+                tree.driver.rules.parent_allows_duplicate_child.push(
+                    crate::models::ParentAllowsDuplicateChildRule {
+                        match_rules: Vec::new(),
+                    },
+                );
+            }
+            let mut last = tree.root;
+            for text in texts {
+                last = tree.add_child(tree.root, text, false, false).unwrap();
+            }
+            tree.add_child(last, "nested", false, false).unwrap();
+            (tree, last)
+        };
+        let (mut fast, fast_last) = build();
+        let (mut slow, slow_last) = build();
+        fast.discard_last_child(fast_last);
+        slow.delete_child(slow_last);
+        let fast_children = &fast.arena[fast.root].children;
+        let slow_children = &slow.arena[slow.root].children;
+        assert_eq!(fast_children.len(), slow_children.len());
+        assert!(!fast.arena.contains(fast_last));
+        assert_eq!(fast.arena.len(), slow.arena.len());
+        let mut fast_keys: Vec<_> = fast_children.keys().collect();
+        let mut slow_keys: Vec<_> = slow_children.keys().collect();
+        fast_keys.sort_unstable();
+        slow_keys.sort_unstable();
+        assert_eq!(fast_keys, slow_keys);
+        for text in texts {
+            assert_eq!(
+                fast_children.get(text).map(|id| id.index),
+                slow_children.get(text).map(|id| id.index)
+            );
+        }
+    }
+
+    #[test]
+    fn test_discard_last_child_matches_delete_child() {
+        assert_discard_matches_delete(&["a", "b", "c"], false);
+        assert_discard_matches_delete(&["c"], false);
+        // The trailing child shares its text with an earlier child, so the index
+        // must keep pointing at the earlier one.
+        assert_discard_matches_delete(&["a", "c", "b", "c"], false);
+        assert_discard_matches_delete(&["a", "c", "b", "c"], true);
+    }
+
+    #[test]
+    fn test_discard_last_child_falls_back_when_not_trailing() {
+        let mut tree = Tree::for_platform(Platform::Generic);
+        let first = tree.add_child(tree.root, "first", true, false).unwrap();
+        let second = tree.add_child(tree.root, "second", true, false).unwrap();
+        tree.discard_last_child(first);
+        let children = &tree.arena[tree.root].children;
+        assert_eq!(children.as_slice(), [second]);
+        assert_eq!(children.get("first"), None);
+        assert_eq!(children.get("second"), Some(second));
+        // Root and missing handles are ignored, mirroring `delete_child`.
+        tree.discard_last_child(tree.root);
+        tree.discard_last_child(first);
+        assert_eq!(tree.arena[tree.root].children.as_slice(), [second]);
+    }
 
     #[test]
     fn test_duplicate_children_allowed_at_root_by_empty_rule() {

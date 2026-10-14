@@ -129,6 +129,28 @@ impl Children {
         }
     }
 
+    /// Removes `id` in O(1) when it is the trailing child, returning whether it did.
+    ///
+    /// Unlike [`Self::delete_by_id`] this does not rebuild the mapping, so it only
+    /// reproduces a rebuild when the mapping already indexes the first occurrence of
+    /// every text (as `append` and the rebuilding mutators maintain). Under that
+    /// invariant the trailing child is indexed only if no earlier sibling shares its
+    /// text, so dropping its own entry is all a rebuild would change.
+    pub(crate) fn pop_if_last(&mut self, id: NodeId, text: &str) -> bool {
+        if self.data.last() != Some(&id) {
+            return false;
+        }
+        self.data.pop();
+        if self.data.is_empty() {
+            self.mapping = None;
+        } else if let Some(mapping) = self.mapping.as_mut()
+            && mapping.get(text) == Some(&id)
+        {
+            mapping.remove(text);
+        }
+        true
+    }
+
     /// Removes all children with the given text and rebuilds the text mapping.
     pub fn delete_by_text(&mut self, text: &str, arena: &Arena<Node>) {
         if self.contains(text) {

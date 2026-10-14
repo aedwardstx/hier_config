@@ -150,7 +150,7 @@ impl<'a> RemediationContext<'a> {
                 self.compute_node(self_child_id, target_child_id, subtree_id)?;
 
                 if self.delta.arena[subtree_id].children.is_empty() {
-                    self.delta.delete_child(subtree_id);
+                    self.delta.discard_last_child(subtree_id);
                 }
             } else {
                 // Target child is absent from source
@@ -624,7 +624,7 @@ impl DiffTrees<'_> {
                 }
 
                 if self.delta.arena[delta_child].children.is_empty() {
-                    self.delta.delete_child(delta_child);
+                    self.delta.discard_last_child(delta_child);
                 }
             } else {
                 self.delta

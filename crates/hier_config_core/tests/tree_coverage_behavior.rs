@@ -744,3 +744,45 @@ fn tree_error_messages_identify_context() {
     assert!(banner.contains("banner motd ^"));
     assert!(banner.ends_with("their delimiter or by a '!' line."));
 }
+
+#[test]
+fn shallow_copies_keep_tag_semantics_without_allocating_empty_extras() {
+    let mut src = Tree::default();
+    let src_root = src.root;
+    let branch = add(&mut src, src_root, "branch");
+    let tagged = add(&mut src, branch, "tagged");
+    let plain_leaf = add(&mut src, src_root, "plain");
+    src.tags_add(tagged, &["t"]);
+
+    let mut dst = Tree::default();
+    let dst_root = dst.root;
+    let copied_branch = dst
+        .add_shallow_copy_of(dst_root, &src, branch, false)
+        .unwrap();
+    let copied_plain = dst
+        .add_shallow_copy_of(dst_root, &src, plain_leaf, false)
+        .unwrap();
+    // A branch never stores its descendants' tags, and an untouched node keeps
+    // the one-pointer representation instead of an empty extras block.
+    assert!(dst.arena[copied_branch].extras().is_none());
+    assert!(dst.arena[copied_plain].extras().is_none());
+
+    let merged_branch = dst
+        .add_shallow_copy_of(dst_root, &src, branch, true)
+        .unwrap();
+    assert_eq!(merged_branch, copied_branch);
+    assert!(dst.arena[merged_branch].tags().is_empty());
+    assert_eq!(
+        dst.arena[merged_branch].instances(),
+        [Instance {
+            id: u64::from(branch.index),
+            comments: BTreeSet::new(),
+            tags: tags(&["t"]),
+        }]
+    );
+    let merged_leaf = dst
+        .add_shallow_copy_of(copied_branch, &src, tagged, true)
+        .unwrap();
+    assert_eq!(dst.arena[merged_leaf].tags(), &tags(&["t"]));
+    assert_eq!(dst.arena[merged_leaf].instances()[0].tags, tags(&["t"]));
+}
