@@ -207,6 +207,15 @@ uv run --no-sync pytest -m benchmark -k test_parse_large_ios_config -v -s
 
 If a benchmark fails its time threshold, investigate the relevant code path for performance regressions.
 
+The Rust core has a separate [Criterion](https://bheisler.github.io/criterion.rs/book/) suite in `crates/hier_config_core/benches/workflows.rs`. It times the same workloads natively, without Python overhead, and can save and compare baselines:
+
+```bash
+cargo bench -p hier_config_core --bench workflows -- --save-baseline before
+cargo bench -p hier_config_core --bench workflows -- --baseline before
+```
+
+See [Native Benchmarks with Criterion](benchmarks.md#native-benchmarks-with-criterion) for the workloads and how to compare two checkouts.
+
 ## v3 compatibility tests
 
 `tests/integration/v3_scenarios.py` holds scenarios that run under **both** hier_config v3 and v4. Its core mirrors `nautobot_golden_config.models._get_hierconfig_remediation`, the reference v3 consumer. Keep that module importable on both majors: no v4-only imports, no pytest fixtures, and no v4 behaviour that the [v3 compatibility surface](../user/v3-compatibility.md) does not cover.

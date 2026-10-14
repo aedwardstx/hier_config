@@ -30,6 +30,14 @@ v4 design decisions, for the record:
 
 ### Added
 
+- Criterion benchmarks for the Rust core in
+  `crates/hier_config_core/benches/workflows.rs` (`cargo bench -p
+  hier_config_core --bench workflows`). They cover parsing, deepcopy,
+  remediation, rollback, future, traversal, dump, merge, unified diff and
+  difference on the same generated configs as the Python benchmarks, including
+  non-ASCII workloads, and support saved baselines for before/after
+  comparisons. `criterion` is a dev-dependency only. (#TBD)
+
 - `NodeComments`, a public set-like view over one node's comments, returned by
   `HConfigChild.comments`. It exposes the full mutable-set API (`add`,
   `discard`, `remove`, `pop`, `update`, `clear`, `copy`, the algebra operators

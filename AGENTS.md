@@ -54,6 +54,9 @@ uv run --no-sync mkdocs build --strict
 # Benchmarks (deselected by default via the `benchmark` marker)
 uv run --no-sync pytest -m benchmark -v -s
 
+# Native Rust benchmarks (Criterion; save/compare with --save-baseline/--baseline)
+cargo bench -p hier_config_core --bench workflows
+
 # Diff this tree against a live hier-config v3 install
 # (deselected by default via the `v3_differential` marker; builds a venv)
 uv run --no-sync pytest -m v3_differential -v

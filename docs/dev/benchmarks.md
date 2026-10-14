@@ -389,6 +389,84 @@ Caveats:
   returns "no match" directly. Before this change, such a line could fail with
   the backtracking engine's limit error.
 
+### Native Benchmarks with Criterion
+
+The Rust core has its own benchmark suite,
+`crates/hier_config_core/benches/workflows.rs`, built on
+[Criterion](https://bheisler.github.io/criterion.rs/book/). It covers every
+operation in the comparison above, plus `merge`, `unified_diff` and
+`difference`, and two non-ASCII workloads. Its config generators reproduce the
+Python generators in `tests/benchmarks/test_benchmarks.py` byte for byte, so
+both suites time the same work.
+
+The suite times the Rust core only. It does not include PyO3 handles, Python
+object construction or interpreter overhead, so its numbers are a lower bound
+for the Python API. Use the Python suites for end-to-end figures and the CI
+gate.
+
+```bash
+# Run everything (bench builds inherit the release profile: fat LTO, 1 CGU)
+cargo bench -p hier_config_core --bench workflows
+
+# One group or benchmark, by regex filter
+cargo bench -p hier_config_core --bench workflows -- parse/
+
+# Save a baseline before a change, then compare against it afterwards
+cargo bench -p hier_config_core --bench workflows -- --save-baseline before
+cargo bench -p hier_config_core --bench workflows -- --baseline before
+
+# Smoke-test every benchmark once without timing it
+cargo bench -p hier_config_core --bench workflows -- --test
+```
+
+Criterion stores results under `target/criterion`. To compare two checkouts,
+for example a branch against `next`, point both at one results directory with
+`CRITERION_HOME`, then save a baseline from each and compare. Alternate the runs
+so drift (thermal state, background load) affects both builds equally.
+
+Native before/after for Pass 6 and the `merge` change: Apple M2 Max, rustc
+1.98.1. The baseline was `e86911d`, with the same benchmark file added. Builds
+ran alternately, two rounds each, with Criterion's default 100 samples per
+benchmark. The table shows the lower of the two rounds' median estimates. Within
+each build, the two rounds agreed to within 6% (`parse/ios_50k`) and otherwise
+to within 3%.
+
+| Benchmark | Before | After | Time reduction | 50% goal |
+|---|---:|---:|---:|---|
+| `parse/ios_1k` | 0.281 ms | 0.192 ms | 32% | not met |
+| `parse/ios_10k` | 2.151 ms | 1.464 ms | 32% | not met |
+| `parse/ios_50k` | 10.375 ms | 6.968 ms | 33% | not met |
+| `parse/xr_10k` | 7.957 ms | 2.763 ms | 65% | met |
+| `parse/unicode_10k` | 2.310 ms | 1.570 ms | 32% | not met |
+| `deepcopy_10k` | 0.153 ms | 0.146 ms | 5% | not met |
+| `remediation/10k` | 3.732 ms | 1.141 ms | 69% | met |
+| `remediation/50k` | 32.203 ms | 5.472 ms | 83% | met |
+| `remediation/unicode_10k` | 3.788 ms | 1.117 ms | 71% | met |
+| `future_1000_interfaces` | 1.362 ms | 0.831 ms | 39% | not met |
+| `rollback_1000_interfaces` | 3.155 ms | 0.991 ms | 69% | met |
+| `all_children_sorted_10k` | 0.039 ms | 0.039 ms | 0% | not met |
+| `dump_10k` | 0.350 ms | 0.347 ms | 1% | not met |
+| `merge_10k` | 1.399 ms | 0.931 ms | 33% | not met |
+| `diff/unified_diff_10k` | 0.426 ms | 0.279 ms | 34% | not met |
+| `diff/unified_diff_unicode_10k` | 0.442 ms | 0.276 ms | 38% | not met |
+| `diff/difference_10k` | 3.436 ms | 0.826 ms | 76% | met |
+| `diff/difference_unicode_10k` | 3.450 ms | 0.828 ms | 76% | met |
+
+Caveats:
+
+- Native `dump_10k` builds the `Dump` struct in about 0.35 ms. The Python
+  `dump()` takes about 3.4 ms, almost all of it building Python objects, which
+  is why neither figure moved.
+- Native `all_children_sorted` is a walk that returns node ids. The Python
+  traversal cost is in creating handles, and that is outside this suite.
+- Python `HConfig.merge()` used to recurse through Python method calls for
+  every node. The native core merge above was never the bottleneck. Copying a
+  stock `HConfig` from another tree now runs in one native pass, and merging a
+  10k-line config into a freshly parsed one dropped from about 38 ms to about
+  18 ms end to end (three alternating rounds of 15 samples), roughly half.
+  The rest is mostly pydantic `Instance` construction, one per copied node.
+  `HConfig` subclasses and same-tree merges keep the overridable per-node path.
+
 ---
 
 ## Performance Guardrails in CI

@@ -25,6 +25,8 @@ uv run --no-sync pytest -m benchmark -v -s
 uv run --no-sync pytest -m benchmark -k test_parse_large_ios_config -v -s
 ```
 
+Native Rust benchmarks use Criterion in `crates/hier_config_core/benches/workflows.rs` (`cargo bench -p hier_config_core --bench workflows`; compare runs with `-- --save-baseline NAME` then `-- --baseline NAME`). They time the core without Python overhead; see `docs/dev/benchmarks.md`.
+
 Use `-s` to see printed timing results. Each benchmark reports the best time over 3 iterations and asserts an upper bound (parsing `< 5s`; remediation `< 5s` small diff / `< 10s` large; iteration `< 2s`–`< 5s`). If a benchmark fails its time threshold, investigate the relevant code path for performance regressions.
 
 After running benchmarks, always display the results to the user in a table format summarizing each benchmark's config size and elapsed time.
