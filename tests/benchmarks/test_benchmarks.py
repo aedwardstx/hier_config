@@ -350,3 +350,75 @@ class TestIterationBenchmarks:
         elapsed = _time_fn(config.deep_copy)
         print(f"\ndeep_copy: {elapsed:.4f}s")
         assert elapsed < 5.0, f"deep_copy took {elapsed:.2f}s, expected < 5s"
+
+    @staticmethod
+    def test_str_render() -> None:
+        """Render a large config with sectional exits, as ``str()`` does."""
+        config = HConfig.from_text(Platform.CISCO_IOS, _generate_large_ios_config())
+        rendered = str(config)
+        assert rendered.splitlines() == list(config.to_lines(sectional_exiting=True))
+
+        elapsed = _time_fn(partial(str, config))
+        print(f"\nstr: {rendered.count(chr(10)) + 1} lines in {elapsed:.4f}s")
+        assert elapsed < 2.0, f"str took {elapsed:.2f}s, expected < 2s"
+
+    @staticmethod
+    def test_dump() -> None:
+        """Serialise a large config to a ``Dump`` model."""
+        config = HConfig.from_text(Platform.CISCO_IOS, _generate_large_ios_config())
+        assert len(config.dump().lines) == len(tuple(config.all_children()))
+
+        elapsed = _time_fn(config.dump)
+        print(f"\ndump: {elapsed:.4f}s")
+        assert elapsed < 2.0, f"dump took {elapsed:.2f}s, expected < 2s"
+
+
+class TestComparisonBenchmarks:
+    """Benchmarks for comparing and combining large configs."""
+
+    @staticmethod
+    def _changed_pair() -> tuple[HConfig, HConfig]:
+        running_text = _generate_large_ios_config()
+        generated_text = running_text.replace(
+            " ip ospf cost 100", " ip ospf cost 200", 100
+        )
+        return (
+            HConfig.from_text(Platform.CISCO_IOS, running_text),
+            HConfig.from_text(Platform.CISCO_IOS, generated_text),
+        )
+
+    @staticmethod
+    def test_unified_diff() -> None:
+        """Unified diff of two large configs with 100 changed interfaces."""
+        running, generated = TestComparisonBenchmarks._changed_pair()
+        diff = tuple(running.unified_diff(generated))
+        # Each changed interface yields its header plus a removed and added line.
+        assert len(diff) == 300
+
+        elapsed = _time_fn(lambda: tuple(running.unified_diff(generated)))
+        print(f"\nunified_diff: {len(diff)} lines in {elapsed:.4f}s")
+        assert elapsed < 2.0, f"unified_diff took {elapsed:.2f}s, expected < 2s"
+
+    @staticmethod
+    def test_difference() -> None:
+        """Difference of two large configs with 100 changed interfaces."""
+        running, generated = TestComparisonBenchmarks._changed_pair()
+        difference = running.difference(generated)
+        assert len(difference.children) == 100
+
+        elapsed = _time_fn(partial(running.difference, generated))
+        print(f"\ndifference: {elapsed:.4f}s")
+        assert elapsed < 2.0, f"difference took {elapsed:.2f}s, expected < 2s"
+
+    @staticmethod
+    def test_merge() -> None:
+        """Merge a large config into an empty one."""
+        config = HConfig.from_text(Platform.CISCO_IOS, _generate_large_ios_config())
+        merged = HConfig.from_text(Platform.CISCO_IOS, "").merge(config)
+        assert merged.to_lines() == config.to_lines()
+
+        elapsed = _time_fn(
+            lambda: HConfig.from_text(Platform.CISCO_IOS, "").merge(config)
+        )
+        print(f"\nmerge: {elapsed:.4f}s")
+        assert elapsed < 5.0, f"merge took {elapsed:.2f}s, expected < 5s"
