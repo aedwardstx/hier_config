@@ -5,7 +5,7 @@ The Rust rewrite retains the main tree/driver/workflow API but includes explicit
 the profiled release build, not a proof that every future optimization requires
 an API break. Some measured hot paths are dominated by CPython object construction.
 
-This document records what is *left* to do. It lists the two remaining optimisations, what each would cost to unlock, and the measurements that justify them. Work that has already shipped is not tracked here — see `CHANGELOG.md` for history, [Performance & Benchmarks](benchmarks.md) for the 3.x to 4.0 benchmark story, [Architecture](architecture.md#core-tree-model) for the data-layout decisions and invariants that came out of it, and the [3.x → 4.0 migration guide](../user/rust-core-changes.md) for consumer-facing consequences.
+This document records what is *left* to do. It lists the remaining optimisation opportunities, what each would cost to unlock, and the measurements that justify them. Items 1–2 are bounded by the Python object model; items 3–11 are Rust-side leads from profiling. Work that has already shipped is not tracked here — see `CHANGELOG.md` for history, [Performance & Benchmarks](benchmarks.md) for the 3.x to 4.0 benchmark story, [Architecture](architecture.md#core-tree-model) for the data-layout decisions and invariants that came out of it, and the [3.x → 4.0 migration guide](../user/rust-core-changes.md) for consumer-facing consequences.
 
 ---
 
@@ -24,7 +24,7 @@ Reference figures on an Apple M2 Max, release build (`maturin develop --release`
 
 Re-derive these with `pytest -m benchmark tests/benchmarks/test_perf_regression.py -v -s` rather than trusting any number written down here.
 
-**The two CPython-bound operations are gated on the object model.** `parse`, `fast_load`, `deepcopy`, and `remediation` are Rust-bound. An earlier version of this page said their headroom had been collected. [Pass 6](benchmarks.md#pass-6-rust-hot-path-profiling-against-the-comparison-workloads) then cut parse time by 31–38% and remediation time on wide sections by 75–88% without any API change, so treat "Rust-bound" as "needs a profile", not "finished". Remaining Rust hot spots in parse are line normalisation, `SipHash` on wide sections, and the per-line rule `RegexSet` prefilter with its substitutions.
+**The two CPython-bound operations are gated on the object model.** `parse`, `fast_load`, `deepcopy`, and `remediation` are Rust-bound. An earlier version of this page said their headroom had been collected. [Pass 6](benchmarks.md#pass-6-rust-hot-path-profiling-against-the-comparison-workloads) then cut parse time by 31–38% and remediation time on wide sections by 75–88% without any API change, so treat "Rust-bound" as "needs a profile", not "finished". The Rust-side leads that profiling still shows are listed under [Rust-side opportunities](#rust-side-opportunities).
 
 ### Why the rest is finished
 
@@ -109,6 +109,70 @@ What is left is the `Py::new` per node itself. That is only avoidable by not con
 
 ---
 
+## Rust-side opportunities
+
+These come from `sample` profiles of the release extension and from the Criterion suite in `crates/hier_config_core/benches/workflows.rs` (see [Native Benchmarks with Criterion](benchmarks.md#native-benchmarks-with-criterion)). None changes the public API. They are leads, not validated gains: re-profile on the current tree, prototype, and keep a change only if a saved Criterion baseline shows a gain worth its complexity.
+
+Current native figures (Apple M2 Max, Criterion median):
+
+| Workload | Native time | Main remaining cost |
+|---|---:|---|
+| `parse/ios_10k` | 1.46 ms | Parser loop, `SipHash`, substitutions, whitespace trims |
+| `parse/xr_10k` | 2.76 ms | Rule regex matching (`MatchRegex::is_match`, `fancy_regex`) |
+| `remediation/50k` | 5.47 ms | Child-index hashing, `Children::rebuild_mapping` |
+| `future_1000_interfaces` | 0.83 ms | `SipHash`, tag `BTreeSet<String>` churn, shallow copies |
+| `deepcopy_10k` | 0.15 ms | Per-node index clones and drops |
+| `merge_10k` | 0.93 ms | Per-node copy and index insert |
+
+### 3. Use a faster seeded hasher for child indexes
+
+**Evidence:** `SipHash` (`Sip13Rounds::write`) is among the top two leaf frames in IOS parse, 50k remediation and future, and `hashbrown` entry lookup is the top frame in remediation.
+**Cost:** a new hashing crate (for example `foldhash`) is a new dependency of the shipped extension, so it needs an issue first. The hasher must stay randomly seeded per process so wide sections keep their hash-flooding resistance.
+**Note:** the small-section vector index already skips hashing for sections of up to eight children; this item is about wide sections.
+
+### 4. Cache rule-match results per lineage
+
+**Evidence:** in IOS-XR parsing, `MatchRegex::is_match` is the top leaf frame by a wide margin, followed by `fancy_regex` state saves. Sectional-exit and indent rules are re-evaluated for many lines whose lineage shape repeats.
+**Approach:** compile each driver's rules once into a shared, immutable matcher (keyed by driver rules identity and invalidated on mutation), and memoise per-parent decisions where a rule depends only on the parent lineage.
+**Constraint:** `HConfigDriverRules` lists are mutable by design (#286). Any cache must observe mutations, or be rebuilt per operation as today.
+
+### 5. Skip per-line substitutions that cannot match
+
+**Evidence:** `PreparedSubs::apply` and `Regex::replacen` are both visible leaf frames in IOS parsing, alongside `trim_start_matches`/`trim_matches`.
+**Approach:** test all substitution patterns with one `RegexSet` (or a literal prefilter) per line and only run `replacen` for the patterns that hit; fold leading and trailing whitespace trimming into the line-boundary scan the parser already performs.
+
+### 6. Maintain child indexes incrementally on delete
+
+**Evidence:** `Children::rebuild_mapping` is the top hier_config frame in 50k remediation after hashing.
+**Approach:** update the index in place (swap-remove with position fix-up, or tombstones compacted lazily) instead of rebuilding after deletions. Child order and `Children` equality must be preserved.
+
+### 7. Intern tags
+
+**Evidence:** in future projection, dropping `BTreeSet<String>` tag sets and `Tree::tags` are prominent leaf frames.
+**Approach:** intern tag strings per tree and store small sorted id sets or bitsets on nodes; materialise strings only at the Python boundary.
+
+### 8. Cheaper tree clone and drop
+
+**Evidence:** `deepcopy` time is split between `Tree::clone`/`Children::clone` and dropping per-node `HashMap` boxes and `NodeExtras`.
+**Approach:** rebuild large-section indexes lazily on first lookup after a clone, or share immutable text and extras behind reference counts with copy-on-write. Only matters for workloads that clone in a loop; absolute cost is already small.
+
+### 9. Profile-guided optimisation for release wheels
+
+**Approach:** build wheels with PGO trained on the Criterion workloads (`cargo pgo` or manual `-Cprofile-generate`/`-Cprofile-use`). Gains are typically single to low double digits for branchy parsers.
+**Cost:** CI complexity and longer release builds; measure with the Criterion suite against a non-PGO build before adopting.
+
+### 10. Release the GIL for long native operations
+
+**Approach:** wrap parse, remediation and diff in `Python::allow_threads` where the native work does not touch Python objects. This does not cut single-call latency; it lets multi-threaded callers run devices in parallel.
+**Constraint:** operations that invoke Python callbacks or custom rule hooks must re-acquire the GIL, and handles must not be borrowed across the release.
+
+### 11. Batch `Instance` construction in Python `merge`
+
+**Evidence:** after the native cross-tree copy, about 8 ms of the ~18 ms Python `merge` of a 10k-line config is pydantic `Instance` construction, one per copied node (`_PyObject_Malloc`/`_Free` and GC dominate the profile). `model_construct` was measured and was slower.
+**Approach:** share one `Instance` per merge where the per-node fields are identical, or store instances natively and materialise them lazily. Either changes object identity of `Instance` values, so check the public contract first; this sits with items 1–2 as an object-model question.
+
+---
+
 ## What is not worth attempting
 
 - **More Rust-side work on `dump`.** It is at ~246 ns/line against a ~250 ns CPython floor. Item 1 or nothing.
@@ -130,6 +194,6 @@ What is left is the `Py::new` per node itself. That is only avoidable by not con
 
 ## Realistic ceiling
 
-Taking both items would land `iteration` at ~0.026 units and `dump` at ~0.15. Neither affects the Rust-bound operations.
+Taking items 1 and 2 would land `iteration` at ~0.026 units and `dump` at ~0.15. Neither affects the Rust-bound operations.
 
-A blanket "2x across the board" is **not** achievable while the current API holds. That is a measured result, not a prediction. Pass 6 cleared 2x on XR parsing, remediation, and rollback. It reached 1.4–1.7x on IOS parsing and future projection and 1.1x on `deepcopy`, and moved `dump` and `all_children_sorted` not at all. The remaining CPython-bound gains are concentrated in `dump` and `iteration`, and both are paid for in compatibility or in new API surface.
+`dump`, `iteration` and `all_children_sorted` are bounded by CPython object construction while the current API holds; Rust-side work does not move them. The remaining gains there are paid for in compatibility or in new API surface. The Rust-bound operations still have the leads above, and their size is unknown until each is prototyped and measured.

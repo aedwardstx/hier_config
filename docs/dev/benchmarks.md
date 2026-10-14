@@ -360,21 +360,21 @@ build ran alternately in fresh processes, 3 rounds × 25 samples; the table show
 the median of the per-round medians. A baseline-vs-baseline run measured
 roughly ±3% noise.
 
-| Operation | Before | After | Time reduction | 50% goal |
-|---|---:|---:|---:|---|
-| Parse IOS, 1k lines | 0.300 ms | 0.207 ms | 31% | not met |
-| Parse IOS, 10k lines | 2.036 ms | 1.296 ms | 36% | not met |
-| Parse IOS, 50k lines | 9.654 ms | 6.000 ms | 38% | not met |
-| Parse IOS-XR, 10k lines | 7.127 ms | 2.295 ms | 68% | met |
-| Parse non-ASCII IOS, 10k lines | 2.181 ms | 1.414 ms | 35% | not met |
-| `deepcopy` (10k) | 0.142 ms | 0.124 ms | 12% | not met |
-| Remediation (10k) | 3.742 ms | 0.934 ms | 75% | met |
-| Remediation (50k) | 33.604 ms | 4.162 ms | 88% | met |
-| Remediation, non-ASCII (10k) | 3.810 ms | 0.950 ms | 75% | met |
-| Future projection (1k interfaces) | 1.238 ms | 0.723 ms | 42% | not met |
-| Rollback (1k interfaces) | 3.149 ms | 0.823 ms | 74% | met |
-| `all_children_sorted` (10k) | 0.419 ms | 0.414 ms | 1% | not met |
-| `dump()` (10k) | 3.395 ms | 3.428 ms | −1% (noise) | not met |
+| Operation | Before | After | Time reduction |
+|---|---:|---:|---:|
+| Parse IOS, 1k lines | 0.300 ms | 0.207 ms | 31% |
+| Parse IOS, 10k lines | 2.036 ms | 1.296 ms | 36% |
+| Parse IOS, 50k lines | 9.654 ms | 6.000 ms | 38% |
+| Parse IOS-XR, 10k lines | 7.127 ms | 2.295 ms | 68% |
+| Parse non-ASCII IOS, 10k lines | 2.181 ms | 1.414 ms | 35% |
+| `deepcopy` (10k) | 0.142 ms | 0.124 ms | 12% |
+| Remediation (10k) | 3.742 ms | 0.934 ms | 75% |
+| Remediation (50k) | 33.604 ms | 4.162 ms | 88% |
+| Remediation, non-ASCII (10k) | 3.810 ms | 0.950 ms | 75% |
+| Future projection (1k interfaces) | 1.238 ms | 0.723 ms | 42% |
+| Rollback (1k interfaces) | 3.149 ms | 0.823 ms | 74% |
+| `all_children_sorted` (10k) | 0.419 ms | 0.414 ms | 1% |
+| `dump()` (10k) | 3.395 ms | 3.428 ms | −1% (noise) |
 
 Caveats:
 
@@ -431,26 +431,26 @@ benchmark. The table shows the lower of the two rounds' median estimates. Within
 each build, the two rounds agreed to within 6% (`parse/ios_50k`) and otherwise
 to within 3%.
 
-| Benchmark | Before | After | Time reduction | 50% goal |
-|---|---:|---:|---:|---|
-| `parse/ios_1k` | 0.281 ms | 0.192 ms | 32% | not met |
-| `parse/ios_10k` | 2.151 ms | 1.464 ms | 32% | not met |
-| `parse/ios_50k` | 10.375 ms | 6.968 ms | 33% | not met |
-| `parse/xr_10k` | 7.957 ms | 2.763 ms | 65% | met |
-| `parse/unicode_10k` | 2.310 ms | 1.570 ms | 32% | not met |
-| `deepcopy_10k` | 0.153 ms | 0.146 ms | 5% | not met |
-| `remediation/10k` | 3.732 ms | 1.141 ms | 69% | met |
-| `remediation/50k` | 32.203 ms | 5.472 ms | 83% | met |
-| `remediation/unicode_10k` | 3.788 ms | 1.117 ms | 71% | met |
-| `future_1000_interfaces` | 1.362 ms | 0.831 ms | 39% | not met |
-| `rollback_1000_interfaces` | 3.155 ms | 0.991 ms | 69% | met |
-| `all_children_sorted_10k` | 0.039 ms | 0.039 ms | 0% | not met |
-| `dump_10k` | 0.350 ms | 0.347 ms | 1% | not met |
-| `merge_10k` | 1.399 ms | 0.931 ms | 33% | not met |
-| `diff/unified_diff_10k` | 0.426 ms | 0.279 ms | 34% | not met |
-| `diff/unified_diff_unicode_10k` | 0.442 ms | 0.276 ms | 38% | not met |
-| `diff/difference_10k` | 3.436 ms | 0.826 ms | 76% | met |
-| `diff/difference_unicode_10k` | 3.450 ms | 0.828 ms | 76% | met |
+| Benchmark | Before | After | Time reduction |
+|---|---:|---:|---:|
+| `parse/ios_1k` | 0.281 ms | 0.192 ms | 32% |
+| `parse/ios_10k` | 2.151 ms | 1.464 ms | 32% |
+| `parse/ios_50k` | 10.375 ms | 6.968 ms | 33% |
+| `parse/xr_10k` | 7.957 ms | 2.763 ms | 65% |
+| `parse/unicode_10k` | 2.310 ms | 1.570 ms | 32% |
+| `deepcopy_10k` | 0.153 ms | 0.146 ms | 5% |
+| `remediation/10k` | 3.732 ms | 1.141 ms | 69% |
+| `remediation/50k` | 32.203 ms | 5.472 ms | 83% |
+| `remediation/unicode_10k` | 3.788 ms | 1.117 ms | 71% |
+| `future_1000_interfaces` | 1.362 ms | 0.831 ms | 39% |
+| `rollback_1000_interfaces` | 3.155 ms | 0.991 ms | 69% |
+| `all_children_sorted_10k` | 0.039 ms | 0.039 ms | 0% |
+| `dump_10k` | 0.350 ms | 0.347 ms | 1% |
+| `merge_10k` | 1.399 ms | 0.931 ms | 33% |
+| `diff/unified_diff_10k` | 0.426 ms | 0.279 ms | 34% |
+| `diff/unified_diff_unicode_10k` | 0.442 ms | 0.276 ms | 38% |
+| `diff/difference_10k` | 3.436 ms | 0.826 ms | 76% |
+| `diff/difference_unicode_10k` | 3.450 ms | 0.828 ms | 76% |
 
 Caveats:
 
