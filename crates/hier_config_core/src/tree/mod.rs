@@ -407,29 +407,29 @@ impl Tree {
         self.arena.insert(node)
     }
 
-    /// Creates a child of `parent_id`, validated like [`Self::add_child`], that is not
-    /// yet one of the parent's children.
+    /// Appends a child sharing `text` to `parent_id` without a duplicate check,
+    /// validated like [`Self::add_child`].
     ///
-    /// Pass it to [`Self::attach_child`] to append it, or to
-    /// [`Self::discard_detached`] to drop it without touching the parent.
-    pub(crate) fn new_detached_child(
+    /// The first child carrying a text stays the one returned by lookups.
+    pub(crate) fn append_shared_child(
         &mut self,
         parent_id: NodeId,
-        text: &str,
+        text: &Arc<str>,
     ) -> Result<NodeId, TreeError> {
         let trimmed = self.validated_child_text(parent_id, text)?;
-        Ok(self.insert_child_node(parent_id, &Arc::from(trimmed)))
+        let child_id = if trimmed.len() == text.len() {
+            self.insert_child_node(parent_id, text)
+        } else {
+            self.insert_child_node(parent_id, &Arc::from(trimmed))
+        };
+        self.attach_child(parent_id, child_id);
+        Ok(child_id)
     }
 
-    /// Appends a child created by [`Self::new_detached_child`] to `parent_id`.
-    pub(crate) fn attach_child(&mut self, parent_id: NodeId, child_id: NodeId) {
+    /// Appends an unlinked child of `parent_id` to its children.
+    fn attach_child(&mut self, parent_id: NodeId, child_id: NodeId) {
         let text = Arc::clone(&self.arena[child_id].text);
         self.arena[parent_id].children.append(&text, child_id, true);
-    }
-
-    /// Removes a child created by [`Self::new_detached_child`] and its subtree.
-    pub(crate) fn discard_detached(&mut self, child_id: NodeId) {
-        self.delete_subtree(child_id);
     }
 
     /// Adds multiple children directly under `parent_id`.
@@ -1134,13 +1134,13 @@ impl Tree {
         }
     }
 
-    /// Sets the text of a node and rebuilds its parent's text mapping.
+    /// Sets the text of a node and updates its parent's text mapping.
     pub fn set_text(&mut self, node_id: NodeId, new_text: &str) {
-        let trimmed = new_text.trim();
-        self.arena[node_id].text = Arc::from(trimmed);
+        let shared: Arc<str> = Arc::from(new_text.trim());
+        let old_text = std::mem::replace(&mut self.arena[node_id].text, Arc::clone(&shared));
         if let Some(parent_id) = self.arena[node_id].parent {
             let mut parent_children = std::mem::take(&mut self.arena[parent_id].children);
-            parent_children.rebuild_mapping(&self.arena);
+            parent_children.retext(node_id, &old_text, &shared, &self.arena);
             self.arena[parent_id].children = parent_children;
         }
     }
@@ -1921,39 +1921,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn detached_child_is_invisible_until_attached() {
+    fn append_shared_child_skips_duplicate_check_and_keeps_first_indexed() {
         let mut tree = Tree::for_platform(Platform::Generic);
         let parent = tree
             .add_child(tree.root, "interface Gi1", true, false)
             .unwrap();
-        tree.add_child(parent, "description a", true, false)
-            .unwrap();
+        let first = tree.add_child(parent, "shutdown", true, false).unwrap();
 
-        let detached = tree.new_detached_child(parent, "  shutdown ").unwrap();
-        tree.add_child(detached, "nested", true, false).unwrap();
-        assert_eq!(tree.arena[parent].children.len(), 1);
-        assert!(!tree.arena[parent].children.contains("shutdown"));
-        assert_eq!(tree.path(detached), ["interface Gi1", "shutdown"]);
+        let shared: Arc<str> = Arc::from("shutdown");
+        let second = tree.append_shared_child(parent, &shared).unwrap();
+        assert!(Arc::ptr_eq(&tree.arena[second].text, &shared));
+        assert_eq!(tree.arena[parent].children.len(), 2);
+        assert_eq!(tree.arena[parent].children.get("shutdown"), Some(first));
+        assert_eq!(tree.path(second), ["interface Gi1", "shutdown"]);
         assert_eq!(
-            tree.arena[detached].real_indent_level,
+            tree.arena[second].real_indent_level,
             tree.arena[parent].real_indent_level + 1
         );
 
-        tree.attach_child(parent, detached);
-        assert_eq!(tree.arena[parent].children.get("shutdown"), Some(detached));
-        assert_eq!(tree.dump_simple(false).len(), 4);
-
-        let discarded = tree.new_detached_child(parent, "discard me").unwrap();
-        let grandchild = tree.add_child(discarded, "nested", true, false).unwrap();
-        tree.discard_detached(discarded);
-        assert!(!tree.arena.contains(discarded));
-        assert!(!tree.arena.contains(grandchild));
-        assert_eq!(tree.arena[parent].children.len(), 2);
-
+        let padded = tree
+            .append_shared_child(parent, &Arc::from("  description a "))
+            .unwrap();
+        assert_eq!(tree.arena[padded].text.as_ref(), "description a");
+        assert_eq!(
+            tree.arena[parent].children.get("description a"),
+            Some(padded)
+        );
         assert!(matches!(
-            tree.new_detached_child(parent, "   "),
+            tree.append_shared_child(parent, &Arc::from("   ")),
             Err(TreeError::EmptyText)
         ));
+        assert_eq!(tree.arena[parent].children.len(), 3);
     }
 
     #[test]

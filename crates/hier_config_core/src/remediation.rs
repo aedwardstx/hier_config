@@ -38,21 +38,76 @@ pub fn config_to_get_to_into(
     RemediationContext::new(source, target, delta).compute()
 }
 
+/// Delta sections entered while walking two trees, created only once a change
+/// is emitted beneath them.
+///
+/// `base` is an existing delta node. Each pending section is appended (and
+/// indexed) under its parent the first time [`Self::node`] is called inside it.
+/// Nothing else is added to a parent while a child section is open, so sibling
+/// order matches creating every section eagerly and dropping the empty ones.
+#[derive(Debug)]
+struct LazyDelta {
+    base: NodeId,
+    sections: Vec<(Arc<str>, Option<NodeId>)>,
+}
+
+impl LazyDelta {
+    const fn new(base: NodeId) -> Self {
+        Self {
+            base,
+            sections: Vec::new(),
+        }
+    }
+
+    fn enter(&mut self, text: &Arc<str>) {
+        self.sections.push((Arc::clone(text), None));
+    }
+
+    fn leave(&mut self) {
+        self.sections.pop();
+    }
+
+    /// The current delta node if it already exists.
+    fn existing(&self) -> Option<NodeId> {
+        self.sections.last().map_or(Some(self.base), |&(_, id)| id)
+    }
+
+    /// The current delta node, creating any pending sections on the way.
+    fn node(&mut self, delta: &mut Tree) -> Result<NodeId, TreeError> {
+        if let Some(id) = self.existing() {
+            return Ok(id);
+        }
+        let created = self.sections.iter().rposition(|&(_, id)| id.is_some());
+        let mut parent = created
+            .and_then(|index| self.sections[index].1)
+            .unwrap_or(self.base);
+        let first_pending = created.map_or(0, |index| index + 1);
+        for (text, id) in &mut self.sections[first_pending..] {
+            parent = delta.append_shared_child(parent, text)?;
+            *id = Some(parent);
+        }
+        Ok(parent)
+    }
+}
+
 /// Context managing the computation of remediation changes between a source and target tree into a delta tree.
 #[derive(Debug)]
 pub struct RemediationContext<'a> {
     pub source: &'a Tree,
     pub target: &'a Tree,
     pub delta: &'a mut Tree,
+    lazy: LazyDelta,
 }
 
 impl<'a> RemediationContext<'a> {
     /// Creates a new remediation context.
     pub const fn new(source: &'a Tree, target: &'a Tree, delta: &'a mut Tree) -> Self {
+        let lazy = LazyDelta::new(delta.root);
         Self {
             source,
             target,
             delta,
+            lazy,
         }
     }
 
@@ -62,27 +117,17 @@ impl<'a> RemediationContext<'a> {
     ///
     /// Returns [`TreeError`] if constructing the remediation tree fails.
     pub fn compute(&mut self) -> Result<(), TreeError> {
-        let delta_root = self.delta.root;
-        self.compute_node(self.source.root, self.target.root, delta_root)
+        self.lazy = LazyDelta::new(self.delta.root);
+        self.compute_node(self.source.root, self.target.root)
     }
 
-    fn compute_node(
-        &mut self,
-        source_node: NodeId,
-        target_node: NodeId,
-        delta_node: NodeId,
-    ) -> Result<(), TreeError> {
-        self.compute_left(source_node, target_node, delta_node)?;
-        self.compute_right(source_node, target_node, delta_node)?;
+    fn compute_node(&mut self, source_node: NodeId, target_node: NodeId) -> Result<(), TreeError> {
+        self.compute_left(source_node, target_node)?;
+        self.compute_right(source_node, target_node)?;
         Ok(())
     }
 
-    fn compute_left(
-        &mut self,
-        source_node: NodeId,
-        target_node: NodeId,
-        delta_node: NodeId,
-    ) -> Result<(), TreeError> {
+    fn compute_left(&mut self, source_node: NodeId, target_node: NodeId) -> Result<(), TreeError> {
         let target_children = self.target.arena[target_node].children.as_slice();
 
         for self_child_id in self.source.arena[source_node].children.iter() {
@@ -103,6 +148,7 @@ impl<'a> RemediationContext<'a> {
             // place, so the duplicate check keys on the pre-negation text.
             let self_text = self_text.to_string();
             let negated_text = self.source.try_compute_negation(self_child_id)?;
+            let delta_node = self.lazy.node(self.delta)?;
             let negated_id = self.delta.add_child(delta_node, &self_text, true, false)?;
             self.delta.set_text(negated_id, &negated_text);
 
@@ -117,18 +163,14 @@ impl<'a> RemediationContext<'a> {
         Ok(())
     }
 
-    fn compute_right(
-        &mut self,
-        source_node: NodeId,
-        target_node: NodeId,
-        delta_node: NodeId,
-    ) -> Result<(), TreeError> {
-        for target_child_id in self.target.arena[target_node].children.iter() {
-            let target_text = &self.target.arena[target_child_id].text;
+    fn compute_right(&mut self, source_node: NodeId, target_node: NodeId) -> Result<(), TreeError> {
+        let target = self.target;
+        for target_child_id in target.arena[target_node].children.iter() {
+            let target_text = &target.arena[target_child_id].text;
 
             if let Some(self_child_id) = self.source.arena[source_node].children.get(target_text) {
                 if self.source.use_sectional_overwrite(self_child_id) {
-                    self.overwrite_with(self_child_id, target_child_id, delta_node, true)?;
+                    self.overwrite_lazy(self_child_id, target_child_id, true)?;
                     continue;
                 }
 
@@ -136,29 +178,30 @@ impl<'a> RemediationContext<'a> {
                     .source
                     .use_sectional_overwrite_without_negation(self_child_id)
                 {
-                    self.overwrite_with(self_child_id, target_child_id, delta_node, false)?;
+                    self.overwrite_lazy(self_child_id, target_child_id, false)?;
                     continue;
                 }
 
-                // Collect subtree changes in a detached child, attached only if
-                // non-empty, so unchanged sections skip a delete-and-remap.
-                // v3 uses `instantiate_child` + `children.append` here, which
-                // performs no duplicate check: the subtree may share its text
-                // with a negation already emitted by `compute_left`.
-                let subtree_id = self.delta.new_detached_child(delta_node, target_text)?;
-                self.compute_node(self_child_id, target_child_id, subtree_id)?;
-
-                if self.delta.arena[subtree_id].children.is_empty() {
-                    self.delta.discard_detached(subtree_id);
-                } else {
-                    self.delta.attach_child(delta_node, subtree_id);
-                }
+                // The subtree section is only created once a change lands in it,
+                // so unchanged sections cost no allocation. v3 uses
+                // `instantiate_child` + `children.append` here, which performs no
+                // duplicate check: the subtree may share its text with a negation
+                // already emitted by `compute_left`.
+                self.lazy.enter(target_text);
+                let result = self.compute_node(self_child_id, target_child_id);
+                self.lazy.leave();
+                result?;
             } else {
                 // Target child is absent from source
-                if self.delta.arena[delta_node].children.contains(target_text) {
+                if self
+                    .lazy
+                    .existing()
+                    .is_some_and(|id| self.delta.arena[id].children.contains(target_text))
+                {
                     continue;
                 }
 
+                let delta_node = self.lazy.node(self.delta)?;
                 let new_item_id =
                     self.delta
                         .add_deep_copy_of(delta_node, self.target, target_child_id, false)?;
@@ -189,7 +232,20 @@ impl<'a> RemediationContext<'a> {
         delta_node: NodeId,
         negate: bool,
     ) -> Result<(), TreeError> {
+        let outer = std::mem::replace(&mut self.lazy, LazyDelta::new(delta_node));
+        let result = self.overwrite_lazy(source_child_id, target_child_id, negate);
+        self.lazy = outer;
+        result
+    }
+
+    fn overwrite_lazy(
+        &mut self,
+        source_child_id: NodeId,
+        target_child_id: NodeId,
+        negate: bool,
+    ) -> Result<(), TreeError> {
         if !children_equal(self.source, source_child_id, self.target, target_child_id) {
+            let delta_node = self.lazy.node(self.delta)?;
             let self_text = &self.source.arena[source_child_id].text;
             // An empty source section carries nothing to drop, so skip the
             // negation and only re-create it. Negating here would emit a
@@ -580,6 +636,7 @@ pub fn difference(source: &Tree, target: &Tree) -> Result<Tree, TreeError> {
     let mut trees = DiffTrees {
         source,
         target,
+        lazy: LazyDelta::new(delta.root),
         delta: &mut delta,
     };
     trees.compute()?;
@@ -590,19 +647,18 @@ struct DiffTrees<'a> {
     source: &'a Tree,
     target: &'a Tree,
     delta: &'a mut Tree,
+    lazy: LazyDelta,
 }
 
 impl DiffTrees<'_> {
     fn compute(&mut self) -> Result<(), TreeError> {
-        let delta_root = self.delta.root;
-        self.compute_node(self.source.root, self.target.root, delta_root, None, false)
+        self.compute_node(self.source.root, self.target.root, None, false)
     }
 
     fn compute_node(
         &mut self,
         source_node: NodeId,
         target_node: NodeId,
-        delta_node: NodeId,
         target_acl_children: Option<&HashMap<String, NodeId>>,
         in_acl: bool,
     ) -> Result<(), TreeError> {
@@ -625,9 +681,9 @@ impl DiffTrees<'_> {
             };
 
             if let Some(target_child_id) = target_child {
-                let delta_child = self.delta.new_detached_child(delta_node, self_text)?;
+                self.lazy.enter(self_text);
 
-                if acl_prefixes
+                let result = if acl_prefixes
                     .iter()
                     .any(|prefix| self_text.starts_with(prefix))
                 {
@@ -637,23 +693,14 @@ impl DiffTrees<'_> {
                         acl_map.insert(stripped, c_id);
                     }
 
-                    self.compute_node(
-                        self_child_id,
-                        target_child_id,
-                        delta_child,
-                        Some(&acl_map),
-                        true,
-                    )?;
+                    self.compute_node(self_child_id, target_child_id, Some(&acl_map), true)
                 } else {
-                    self.compute_node(self_child_id, target_child_id, delta_child, None, false)?;
-                }
-
-                if self.delta.arena[delta_child].children.is_empty() {
-                    self.delta.discard_detached(delta_child);
-                } else {
-                    self.delta.attach_child(delta_node, delta_child);
-                }
+                    self.compute_node(self_child_id, target_child_id, None, false)
+                };
+                self.lazy.leave();
+                result?;
             } else {
+                let delta_node = self.lazy.node(self.delta)?;
                 self.delta
                     .add_deep_copy_of(delta_node, self.source, self_child_id, false)?;
             }

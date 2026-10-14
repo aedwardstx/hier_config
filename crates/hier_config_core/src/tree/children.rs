@@ -72,6 +72,25 @@ impl Index {
         }
     }
 
+    /// Drops the entry for `text` if it maps to `id`.
+    fn remove_if(&mut self, text: &str, id: NodeId) {
+        match self {
+            Self::Linear(entries) => {
+                if let Some(position) = entries
+                    .iter()
+                    .position(|(key, existing)| *existing == id && key.as_ref() == text)
+                {
+                    entries.remove(position);
+                }
+            }
+            Self::Hashed(mapping) => {
+                if mapping.get(text) == Some(&id) {
+                    mapping.remove(text);
+                }
+            }
+        }
+    }
+
     fn keys(&self) -> Box<dyn Iterator<Item = &str> + '_> {
         match self {
             Self::Linear(entries) => Box::new(entries.iter().map(|(key, _)| key.as_ref())),
@@ -274,6 +293,29 @@ impl Children {
                 }
             });
             self.rebuild_mapping(arena);
+        }
+    }
+
+    /// Updates the mapping after the child `id` was renamed from `old_text` to
+    /// `new_text`.
+    ///
+    /// Renaming the last child is the common case (remediation negates a line
+    /// right after adding it) and is updated in place: no later sibling can
+    /// inherit `old_text`, and any earlier holder of `new_text` stays first.
+    /// Other positions fall back to [`Self::rebuild_mapping`].
+    pub(crate) fn retext(
+        &mut self,
+        id: NodeId,
+        old_text: &str,
+        new_text: &Arc<str>,
+        arena: &Arena<Node>,
+    ) {
+        match self.mapping.as_deref_mut() {
+            Some(index) if self.data.last() == Some(&id) => {
+                index.remove_if(old_text, id);
+                index.insert_first(new_text, id);
+            }
+            _ => self.rebuild_mapping(arena),
         }
     }
 
