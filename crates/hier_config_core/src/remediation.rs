@@ -146,7 +146,7 @@ impl<'a> RemediationContext<'a> {
 
             // v3 adds the child under its *original* text and negates it in
             // place, so the duplicate check keys on the pre-negation text.
-            let self_text = self_text.to_string();
+            let self_text = String::from(&**self_text);
             let negated_text = self.source.try_compute_negation(self_child_id)?;
             let delta_node = self.lazy.node(self.delta)?;
             let negated_id = self.delta.add_child(delta_node, &self_text, true, false)?;

@@ -1571,31 +1571,56 @@ impl Tree {
 
     /// Generates rendered configuration lines.
     pub fn lines(&self, node_id: NodeId, sectional_exiting: bool) -> Vec<String> {
-        let mut out = Vec::new();
-        self.collect_lines(node_id, sectional_exiting, &mut out);
+        if !self.arena.contains(node_id) {
+            // A stale id renders as one empty line, as `cisco_style_text` does.
+            return vec![String::new()];
+        }
+        let mut out = Vec::with_capacity(self.traversal_size_hint(node_id) + 1);
+        self.collect_lines(node_id, self.depth(node_id), sectional_exiting, &mut out);
         out
     }
 
-    fn collect_lines(&self, node_id: NodeId, sectional_exiting: bool, out: &mut Vec<String>) {
-        if node_id != self.root {
-            out.push(self.cisco_style_text(node_id, TextStyle::WithoutComments, None));
+    /// Renders `node_id` and its subtree, carrying `depth` down the walk so no
+    /// line re-walks its ancestors.
+    fn collect_lines(
+        &self,
+        node_id: NodeId,
+        depth: usize,
+        sectional_exiting: bool,
+        out: &mut Vec<String>,
+    ) {
+        let node = &self.arena[node_id];
+        let is_root = node_id == self.root;
+        let indentation = self.driver.rules.indentation;
+        if !is_root {
+            out.push(indented(indentation * depth.saturating_sub(1), &node.text));
         }
 
-        for child_id in self.sorted_children(node_id) {
-            self.collect_lines(child_id, sectional_exiting, out);
+        let children = node.children.as_slice();
+        if self.children_already_ordered(children) {
+            for &child_id in children {
+                self.collect_lines(child_id, depth + 1, sectional_exiting, out);
+            }
+        } else {
+            for child_id in self.sorted_children(node_id) {
+                self.collect_lines(child_id, depth + 1, sectional_exiting, out);
+            }
         }
 
-        if node_id != self.root
+        if !is_root
             && sectional_exiting
-            && let Some(exit_text) = self.sectional_exit(node_id)
+            && let Some((exit_text, parent_level)) = self
+                .driver
+                .sectional_exit_line(!children.is_empty(), |rules| {
+                    self.is_lineage_match(node_id, rules)
+                })
         {
-            let depth = if self.sectional_exit_text_parent_level(node_id) {
-                self.depth(node_id).saturating_sub(1)
+            let exit_depth = if parent_level {
+                depth.saturating_sub(1)
             } else {
-                self.depth(node_id)
+                depth
             };
-            let indent = " ".repeat(self.driver.rules.indentation * depth);
-            out.push(format!("{indent}{exit_text}"));
+            out.push(indented(indentation * exit_depth, exit_text));
         }
     }
 
@@ -1696,22 +1721,50 @@ impl Tree {
 
     /// Serializes configuration tree to `Dump`.
     pub fn dump(&self) -> Dump {
-        let lines = self
-            .all_children_sorted(self.root)
-            .into_iter()
-            .map(|id| {
-                let node = &self.arena[id];
-                DumpLine {
-                    depth: self.depth(id),
-                    text: node.text.to_string(),
-                    tags: self.tags(id),
-                    comments: node.comments().clone(),
-                    new_in_config: node.new_in_config,
-                }
-            })
-            .collect();
-
+        let mut lines = Vec::with_capacity(self.arena.len());
+        self.dump_children(self.root, 1, &mut lines);
         Dump { lines }
+    }
+
+    /// Appends the sorted subtree below `node_id` to `out` in pre-order and
+    /// returns the union of its leaf tags, so each node's tags are computed
+    /// once from its children instead of by a fresh walk per node.
+    fn dump_children(
+        &self,
+        node_id: NodeId,
+        depth: usize,
+        out: &mut Vec<DumpLine>,
+    ) -> BTreeSet<String> {
+        let mut union = BTreeSet::new();
+        let children = self.arena[node_id].children.as_slice();
+        let sorted;
+        let ordered = if self.children_already_ordered(children) {
+            children
+        } else {
+            sorted = self.sorted_children(node_id);
+            &sorted
+        };
+        for &child_id in ordered {
+            let node = &self.arena[child_id];
+            let index = out.len();
+            out.push(DumpLine {
+                depth,
+                text: String::from(&*node.text),
+                tags: BTreeSet::new(),
+                comments: node.comments().clone(),
+                new_in_config: node.new_in_config,
+            });
+            let tags = if node.is_leaf() {
+                node.tags().clone()
+            } else {
+                self.dump_children(child_id, depth + 1, out)
+            };
+            if !tags.is_empty() {
+                union.extend(tags.iter().cloned());
+                out[index].tags = tags;
+            }
+        }
+        union
     }
 
     /// Reconstructs the tree structure from a [`Dump`].
@@ -1914,6 +1967,14 @@ impl Iterator for DescendantsSorted<'_> {
     fn size_hint(&self) -> (usize, Option<usize>) {
         (0, Some(self.tree.arena.len()))
     }
+}
+
+/// Builds `text` indented by `width` spaces in a single allocation.
+fn indented(width: usize, text: &str) -> String {
+    let mut line = String::with_capacity(width + text.len());
+    line.extend(std::iter::repeat_n(' ', width));
+    line.push_str(text);
+    line
 }
 
 #[cfg(test)]

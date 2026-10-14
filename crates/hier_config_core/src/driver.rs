@@ -500,31 +500,46 @@ impl Driver {
         has_children: bool,
         is_lineage_match: impl Fn(&[MatchRule]) -> bool,
     ) -> Option<String> {
+        self.sectional_exit_line(has_children, is_lineage_match)
+            .map(|(text, _)| text.to_string())
+    }
+
+    /// Like [`Self::sectional_exit`], borrowing the exit text and also returning
+    /// whether it renders at the parent's indentation level.
+    ///
+    /// Both come from the first matching `sectional_exiting` rule, so renderers
+    /// evaluate the lineage rules once per node instead of twice.
+    pub fn sectional_exit_line(
+        &self,
+        has_children: bool,
+        is_lineage_match: impl Fn(&[MatchRule]) -> bool,
+    ) -> Option<(&str, bool)> {
         for exit_rule in &self.rules.sectional_exiting {
             if is_lineage_match(&exit_rule.match_rules) {
-                if !exit_rule.exit_text.is_empty() {
-                    // Python applies the Huawei VRP `exit` -> `quit` mapping in
-                    // `HuaweiVrpDriver.sectional_exit` *after* the rule lookup has
-                    // returned, so a rule that explicitly declares the generic
-                    // default still renders as the platform token. Route the literal
-                    // through the platform default to keep that parity; this is a
-                    // no-op for every platform except Huawei VRP. Compare against
-                    // `"exit"` exactly, matching Python's plain `==`.
-                    if exit_rule.exit_text == "exit" {
-                        return Some(
-                            crate::platforms::default_sectional_exit(self.platform).to_string(),
-                        );
-                    }
-                    return Some(exit_rule.exit_text.clone());
+                if exit_rule.exit_text.is_empty() {
+                    return None;
                 }
-                return None;
+                // Python applies the Huawei VRP `exit` -> `quit` mapping in
+                // `HuaweiVrpDriver.sectional_exit` *after* the rule lookup has
+                // returned, so a rule that explicitly declares the generic
+                // default still renders as the platform token. Route the literal
+                // through the platform default to keep that parity; this is a
+                // no-op for every platform except Huawei VRP. Compare against
+                // `"exit"` exactly, matching Python's plain `==`.
+                let text = if exit_rule.exit_text == "exit" {
+                    crate::platforms::default_sectional_exit(self.platform)
+                } else {
+                    exit_rule.exit_text.as_str()
+                };
+                return Some((text, exit_rule.exit_text_parent_level));
             }
         }
-        if has_children {
-            Some(crate::platforms::default_sectional_exit(self.platform).to_string())
-        } else {
-            None
-        }
+        has_children.then(|| {
+            (
+                crate::platforms::default_sectional_exit(self.platform),
+                false,
+            )
+        })
     }
 
     /// Computes the idempotency key for a node's lineage.

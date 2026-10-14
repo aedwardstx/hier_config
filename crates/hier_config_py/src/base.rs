@@ -190,7 +190,7 @@ impl PyHConfigBase {
         Ok(tree
             .arena
             .get(self.node_id)
-            .map_or_else(String::new, |n| n.text.to_string()))
+            .map_or_else(String::new, |n| String::from(&*n.text)))
     }
 
     pub fn set_text(&self, text: &str) -> PyResult<()> {
