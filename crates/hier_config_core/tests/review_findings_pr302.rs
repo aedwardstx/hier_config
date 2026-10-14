@@ -41,6 +41,19 @@ fn mf2_splitlines_matches_python_boundaries() {
     assert_eq!(splitlines("a\n").collect::<Vec<_>>(), ["a"]);
 }
 
+#[test]
+fn splitlines_breaks_on_every_python_boundary_and_nothing_else() {
+    assert_eq!(
+        splitlines("a\x0cb\x1cc\x1dd\x1ee\u{2029}f\r\rg\n\nh").collect::<Vec<_>>(),
+        ["a", "b", "c", "d", "e", "f", "", "g", "", "h"]
+    );
+    // Characters sharing a UTF-8 lead byte with NEL/LS/PS are not boundaries.
+    let near_misses = "\u{a0}x\u{a8}\u{2027}\u{202a}\u{2080}é\t\x1f";
+    assert_eq!(splitlines(near_misses).collect::<Vec<_>>(), [near_misses]);
+    assert_eq!(splitlines("\u{2028}").collect::<Vec<_>>(), [""]);
+    assert_eq!(splitlines("x\r").collect::<Vec<_>>(), ["x"]);
+}
+
 // MF-3 -----------------------------------------------------------------
 
 #[test]

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
 
-/// Hash map behind the text index of a large section.
+/// Text-keyed index from a child's text to the *first* child that carries it.
 ///
 /// This deliberately uses `std::collections::HashMap` and its randomly seeded
 /// `RandomState` rather than the faster `FxHashMap` used elsewhere in the crate:
@@ -15,117 +15,97 @@ use std::sync::Arc;
 /// integers/`NodeId`s are not reachable this way and keep using `FxHashMap`.
 type Mapping = HashMap<Arc<str>, NodeId>;
 
-/// Most distinct texts an index holds before it switches to a hash map.
+/// Largest index kept as a linear list before it is promoted to a [`Mapping`].
 ///
-/// Typical sections (an interface, a neighbour) have a handful of children, so a
-/// short linear scan of length-prefixed strings beats hashing every line with
-/// `SipHash`. Lookups stay bounded by this constant; anything larger, including
-/// attacker-sized sections, uses the seeded hash map.
-const SMALL_INDEX_LIMIT: usize = 8;
+/// Most parents in a real configuration have a handful of children. Comparing a
+/// few keys directly is cheaper than hashing the line with `SipHash`, and bounding
+/// the list keeps each scan constant-time, so hash-flooding protection holds.
+const LINEAR_INDEX_MAX: usize = 8;
 
-/// Text-keyed index from a child's text to the *first* child that carries it.
+/// Text index behind [`Children`], sized to the number of indexed children.
 #[derive(Debug, Clone)]
 enum Index {
-    Small(Vec<(Arc<str>, NodeId)>),
-    Large(Mapping),
+    Linear(Vec<(Arc<str>, NodeId)>),
+    Hashed(Mapping),
 }
 
 impl Index {
-    const fn new() -> Self {
-        Self::Small(Vec::new())
+    /// An empty index, sized so it never regrows before promotion.
+    fn new() -> Self {
+        Self::Linear(Vec::with_capacity(LINEAR_INDEX_MAX))
     }
 
-    fn from_map(map: Mapping) -> Self {
-        if map.len() <= SMALL_INDEX_LIMIT {
-            Self::Small(map.into_iter().collect())
+    fn get(&self, text: &str) -> Option<NodeId> {
+        match self {
+            Self::Linear(entries) => entries
+                .iter()
+                .find(|(key, _)| key.as_ref() == text)
+                .map(|&(_, id)| id),
+            Self::Hashed(mapping) => mapping.get(text).copied(),
+        }
+    }
+
+    /// Records `id` for `text` unless an earlier child already claimed it, in
+    /// which case that child's id is returned instead.
+    fn insert_first(&mut self, text: &Arc<str>, id: NodeId) -> Option<NodeId> {
+        match self {
+            Self::Linear(entries) => {
+                if let Some(&(_, existing)) = entries.iter().find(|(key, _)| key == text) {
+                    return Some(existing);
+                }
+                if entries.len() < LINEAR_INDEX_MAX {
+                    entries.push((Arc::clone(text), id));
+                    return None;
+                }
+                let mut mapping: Mapping = entries.drain(..).collect();
+                mapping.insert(Arc::clone(text), id);
+                *self = Self::Hashed(mapping);
+                None
+            }
+            Self::Hashed(mapping) => match mapping.entry(Arc::clone(text)) {
+                Entry::Occupied(entry) => Some(*entry.get()),
+                Entry::Vacant(entry) => {
+                    entry.insert(id);
+                    None
+                }
+            },
+        }
+    }
+
+    fn keys(&self) -> Box<dyn Iterator<Item = &str> + '_> {
+        match self {
+            Self::Linear(entries) => Box::new(entries.iter().map(|(key, _)| key.as_ref())),
+            Self::Hashed(mapping) => Box::new(mapping.keys().map(Arc::as_ref)),
+        }
+    }
+
+    fn from_mapping(mapping: Mapping) -> Self {
+        if mapping.len() <= LINEAR_INDEX_MAX {
+            let mut entries = Vec::with_capacity(LINEAR_INDEX_MAX);
+            entries.extend(mapping);
+            Self::Linear(entries)
         } else {
-            Self::Large(map)
+            Self::Hashed(mapping)
         }
     }
 
     fn len(&self) -> usize {
         match self {
-            Self::Small(entries) => entries.len(),
-            Self::Large(map) => map.len(),
+            Self::Linear(entries) => entries.len(),
+            Self::Hashed(mapping) => mapping.len(),
         }
     }
 
-    fn get(&self, text: &str) -> Option<NodeId> {
+    fn entries(&self) -> Box<dyn Iterator<Item = (&Arc<str>, NodeId)> + '_> {
         match self {
-            Self::Small(entries) => entries
-                .iter()
-                .find(|(key, _)| key.as_ref() == text)
-                .map(|&(_, id)| id),
-            Self::Large(map) => map.get(text).copied(),
+            Self::Linear(entries) => Box::new(entries.iter().map(|(key, id)| (key, *id))),
+            Self::Hashed(mapping) => Box::new(mapping.iter().map(|(key, id)| (key, *id))),
         }
-    }
-
-    /// Indexes `text` unless already present, creating its id only when it is new.
-    fn insert_first(
-        &mut self,
-        text: &Arc<str>,
-        insert: impl FnOnce() -> NodeId,
-    ) -> Result<NodeId, NodeId> {
-        match self {
-            Self::Small(entries) => {
-                if let Some(&(_, existing)) = entries
-                    .iter()
-                    .find(|(key, _)| key.as_ref() == text.as_ref())
-                {
-                    return Err(existing);
-                }
-                let id = insert();
-                if entries.len() < SMALL_INDEX_LIMIT {
-                    entries.push((Arc::clone(text), id));
-                } else {
-                    let mut map = Mapping::with_capacity(SMALL_INDEX_LIMIT * 2);
-                    map.extend(entries.drain(..));
-                    map.insert(Arc::clone(text), id);
-                    *self = Self::Large(map);
-                }
-                Ok(id)
-            }
-            Self::Large(map) => match map.entry(Arc::clone(text)) {
-                Entry::Occupied(existing) => Err(*existing.get()),
-                Entry::Vacant(slot) => Ok(*slot.insert(insert())),
-            },
-        }
-    }
-
-    /// Drops `text` from the index if it currently resolves to `id`.
-    fn remove_if(&mut self, text: &str, id: NodeId) {
-        match self {
-            Self::Small(entries) => {
-                if let Some(position) = entries
-                    .iter()
-                    .position(|(key, value)| *value == id && key.as_ref() == text)
-                {
-                    entries.swap_remove(position);
-                }
-            }
-            Self::Large(map) => {
-                if map.get(text) == Some(&id) {
-                    map.remove(text);
-                }
-            }
-        }
-    }
-
-    fn entries(&self) -> impl Iterator<Item = (&Arc<str>, NodeId)> {
-        let (small, large) = match self {
-            Self::Small(entries) => (Some(entries), None),
-            Self::Large(map) => (None, Some(map)),
-        };
-        small
-            .into_iter()
-            .flatten()
-            .map(|(key, id)| (key, *id))
-            .chain(large.into_iter().flatten().map(|(key, id)| (key, *id)))
     }
 }
 
 impl PartialEq for Index {
-    /// Compares as maps: the representation and the scan order of a small index
+    /// Compares as maps: the representation and the scan order of a linear index
     /// depend on mutation history, not on what it indexes.
     fn eq(&self, other: &Self) -> bool {
         self.len() == other.len() && self.entries().all(|(key, id)| other.get(key) == Some(id))
@@ -134,6 +114,8 @@ impl PartialEq for Index {
 
 impl Eq for Index {}
 
+/// Serialises as a plain text-to-id map whatever the representation, so the
+/// wire form matches the earlier all-`HashMap` index.
 impl Serialize for Index {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.collect_map(self.entries())
@@ -142,7 +124,7 @@ impl Serialize for Index {
 
 impl<'de> Deserialize<'de> for Index {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Mapping::deserialize(deserializer).map(Self::from_map)
+        Mapping::deserialize(deserializer).map(Self::from_mapping)
     }
 }
 
@@ -154,10 +136,10 @@ impl<'de> Deserialize<'de> for Index {
 /// Three details keep this cheap on large configurations. The index is boxed and
 /// only allocated once a child is appended with mapping enabled, so the leaf nodes
 /// that make up most of a parsed tree carry a single null pointer rather than an
-/// empty hash table. Its keys are `Arc<str>` shared with the node itself, so
+/// empty hash table. Small indexes are a linear list rather than a hash table (see
+/// [`LINEAR_INDEX_MAX`]). Its keys are `Arc<str>` shared with the node itself, so
 /// indexing a child is a reference-count bump instead of a second copy of every
-/// configuration line. And small sections are indexed by a short vector rather
-/// than a hash map (see [`SMALL_INDEX_LIMIT`]).
+/// configuration line.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Children {
     data: Vec<NodeId>,
@@ -166,10 +148,6 @@ pub struct Children {
 }
 
 impl Children {
-    fn index_mut(&mut self) -> &mut Index {
-        self.mapping.get_or_insert_with(|| Box::new(Index::new()))
-    }
-
     /// Creates an empty Children container.
     pub const fn new() -> Self {
         Self {
@@ -225,22 +203,32 @@ impl Children {
     pub fn append(&mut self, text: &Arc<str>, child_id: NodeId, update_mapping: bool) {
         self.data.push(child_id);
         if update_mapping {
-            let _ = self.index_mut().insert_first(text, || child_id);
+            self.mapping
+                .get_or_insert_with(|| Box::new(Index::new()))
+                .insert_first(text, child_id);
         }
     }
 
-    /// Appends a child unless one with `text` is already indexed, hashing `text` once.
+    /// Indexes `text` for the child that will be appended as `child_id`, in a
+    /// single lookup.
     ///
-    /// `insert` creates the child only when the text is new; otherwise the existing
-    /// child's id is returned as the error and nothing is modified.
-    pub(crate) fn append_unique(
-        &mut self,
-        text: &Arc<str>,
-        insert: impl FnOnce() -> NodeId,
-    ) -> Result<NodeId, NodeId> {
-        let child_id = self.index_mut().insert_first(text, insert)?;
+    /// Returns the existing child's id, leaving the collection untouched, when a
+    /// child with `text` is already indexed. Otherwise `child_id` is indexed and
+    /// the caller must follow with [`Self::push_claimed`].
+    pub(crate) fn claim(&mut self, text: &Arc<str>, child_id: NodeId) -> Option<NodeId> {
+        self.mapping
+            .get_or_insert_with(|| Box::new(Index::new()))
+            .insert_first(text, child_id)
+    }
+
+    /// Appends a child whose text was indexed by [`Self::claim`].
+    pub(crate) fn push_claimed(&mut self, child_id: NodeId) {
+        // A parent that gains one child usually gains several; size for a few
+        // at once rather than regrowing 0 -> 4 -> 8.
+        if self.data.is_empty() {
+            self.data.reserve_exact(LINEAR_INDEX_MAX);
+        }
         self.data.push(child_id);
-        Ok(child_id)
     }
 
     /// Replaces child at `index` and rebuilds the text mapping.
@@ -275,26 +263,6 @@ impl Children {
         }
     }
 
-    /// Removes `id` in O(1) when it is the trailing child, returning whether it did.
-    ///
-    /// Unlike [`Self::delete_by_id`] this does not rebuild the mapping, so it only
-    /// reproduces a rebuild when the mapping already indexes the first occurrence of
-    /// every text (as `append` and the rebuilding mutators maintain). Under that
-    /// invariant the trailing child is indexed only if no earlier sibling shares its
-    /// text, so dropping its own entry is all a rebuild would change.
-    pub(crate) fn pop_if_last(&mut self, id: NodeId, text: &str) -> bool {
-        if self.data.last() != Some(&id) {
-            return false;
-        }
-        self.data.pop();
-        if self.data.is_empty() {
-            self.mapping = None;
-        } else if let Some(mapping) = self.mapping.as_mut() {
-            mapping.remove_if(text, id);
-        }
-        true
-    }
-
     /// Removes all children with the given text and rebuilds the text mapping.
     pub fn delete_by_text(&mut self, text: &str, arena: &Arena<Node>) {
         if self.contains(text) {
@@ -318,7 +286,7 @@ impl Children {
         let mut index = Index::new();
         for &id in &self.data {
             if let Some(node) = arena.get(id) {
-                let _ = index.insert_first(&node.text, || id);
+                index.insert_first(&node.text, id);
             }
         }
         self.mapping = Some(Box::new(index));
@@ -326,8 +294,6 @@ impl Children {
 
     /// Returns an iterator over all keys in the mapping.
     pub fn keys(&self) -> impl Iterator<Item = &str> {
-        self.mapping
-            .iter()
-            .flat_map(|mapping| mapping.entries().map(|(key, _)| key.as_ref()))
+        self.mapping.iter().flat_map(|index| index.keys())
     }
 }

@@ -123,6 +123,39 @@ fn children_mapping_preserves_first_duplicate_through_mutations() {
 }
 
 #[test]
+fn children_index_keeps_first_occurrence_as_it_grows_and_shrinks() {
+    let mut arena = Arena::new();
+    let mut children = Children::new();
+    let mut first = Vec::new();
+    for i in 0..40 {
+        let text = format!("line {i}");
+        let id = arena.insert(Node::new(&text, None));
+        children.append(&arena[id].text, id, true);
+        first.push(id);
+        let again = arena.insert(Node::new(&text, None));
+        children.append(&arena[again].text, again, true);
+        assert_eq!(children.get(&text), Some(id));
+        for (j, &expected) in first.iter().enumerate() {
+            assert_eq!(children.get(&format!("line {j}")), Some(expected));
+        }
+    }
+    assert!(!children.contains("line 40"));
+    assert_eq!(children.keys().count(), 40);
+
+    for &id in &first[..36] {
+        children.delete_by_id(id, &arena);
+    }
+    assert_eq!(children.keys().count(), 40);
+    assert_ne!(children.get("line 0"), Some(first[0]));
+    for (j, &kept) in first.iter().enumerate().skip(36) {
+        assert_eq!(children.get(&format!("line {j}")), Some(kept));
+    }
+    let mut keys: Vec<&str> = children.keys().collect();
+    keys.sort_unstable();
+    assert_eq!(keys.len(), 40);
+}
+
+#[test]
 fn children_missing_mutations_leave_collection_unchanged() {
     let mut arena = Arena::new();
     let id = arena.insert(Node::new("child", None));

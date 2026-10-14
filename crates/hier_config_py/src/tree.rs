@@ -253,32 +253,32 @@ impl SharedTree {
         py: Python<'_>,
         node_ids: &[NodeId],
     ) -> PyResult<Vec<Py<PyAny>>> {
+        // Validate the batch under one read guard, then release it before `Py::new`,
+        // which can run Python (GC) that re-enters the tree lock. A node deleted after
+        // validation yields a handle that raises on first access.
+        {
+            let tree = self_arc.tree.read_py()?;
+            for &node_id in node_ids {
+                ensure_live(&tree, node_id)?;
+            }
+        }
         let mut out = Vec::with_capacity(node_ids.len());
         for &node_id in node_ids {
-            out.push(Self::new_child_handle(self_arc, py, node_id)?.into_any());
+            let child = Py::new(
+                py,
+                (
+                    crate::child::PyHConfigChild {
+                        parent_handle: None,
+                    },
+                    crate::base::PyHConfigBase {
+                        tree: Arc::clone(self_arc),
+                        node_id,
+                    },
+                ),
+            )?;
+            out.push(child.into_any());
         }
         Ok(out)
-    }
-
-    /// Builds an uncached Python handle for `node_id`.
-    fn new_child_handle(
-        self_arc: &Arc<Self>,
-        py: Python<'_>,
-        node_id: NodeId,
-    ) -> PyResult<Py<crate::child::PyHConfigChild>> {
-        drop(self_arc.read_node(node_id)?);
-        Py::new(
-            py,
-            (
-                crate::child::PyHConfigChild {
-                    parent_handle: None,
-                },
-                crate::base::PyHConfigBase {
-                    tree: Arc::clone(self_arc),
-                    node_id,
-                },
-            ),
-        )
     }
 
     pub fn get_node_facts(&self, py: Python<'_>, node_id: NodeId) -> PyResult<Py<PyDict>> {
@@ -388,6 +388,7 @@ mod tests {
     use hier_config_core::{Driver, Platform};
     use pyo3::ffi::c_str;
     use pyo3::prelude::*;
+    use std::sync::Arc;
 
     fn shared_tree() -> SharedTree {
         let platform = Platform::Generic;
@@ -434,6 +435,43 @@ mod tests {
             drop(owner);
 
             assert!(tree.root_handle(py).unwrap().is_none());
+        });
+    }
+
+    /// Bulk handle materialization validates the whole batch: a deleted node must
+    /// raise instead of handing back a handle that only fails later, and an empty
+    /// batch is simply empty.
+    #[test]
+    fn children_batch_rejects_a_deleted_node() {
+        Python::initialize();
+        Python::attach(|py| {
+            let mut shared = shared_tree();
+            let root = shared.tree.get_mut().unwrap().root;
+            let ids = shared
+                .tree
+                .get_mut()
+                .unwrap()
+                .add_children(root, &["a", "b"])
+                .unwrap();
+            let shared = Arc::new(shared);
+
+            assert!(
+                SharedTree::get_or_create_children_batch(&shared, py, &[])
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                SharedTree::get_or_create_children_batch(&shared, py, &ids)
+                    .unwrap()
+                    .len(),
+                2
+            );
+
+            shared.tree.write().unwrap().delete_child(ids[1]);
+            let err = SharedTree::get_or_create_children_batch(&shared, py, &ids)
+                .expect_err("a deleted node in the batch must raise");
+            assert!(err.is_instance_of::<pyo3::exceptions::PyValueError>(py));
+            assert!(err.to_string().contains("has been deleted"));
         });
     }
 }

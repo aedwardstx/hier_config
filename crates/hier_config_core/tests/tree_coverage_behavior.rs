@@ -126,6 +126,54 @@ fn accessor_lineage_and_traversal_size_hint_follow_actual_nodes() {
         leaf,
         &[MatchRule::equals("other"), MatchRule::equals("leaf")]
     ));
+    // An empty rule list matches an empty lineage, which is what both the root and a
+    // node that is no longer in the arena have.
+    assert!(tree.is_lineage_match(root, &[]));
+    assert!(!tree.is_lineage_match(leaf, &[]));
+    assert!(tree.is_lineage_match(missing(), &[]));
+    assert!(!tree.is_lineage_match(missing(), &[MatchRule::equals("leaf")]));
+    assert!(!tree.is_lineage_match(root, &[MatchRule::equals("branch")]));
+}
+
+#[test]
+fn lineage_match_of_detached_node_follows_its_remaining_chain() {
+    // A node whose parent link is gone still has the lineage `lineage()` reports for
+    // it -- itself, and nothing above -- so single-rule matches against it succeed.
+    let mut tree = Tree::default();
+    let root = tree.root;
+    let detached = tree.create_child_unattached(root, "orphan");
+    tree.arena[detached].parent = None;
+    assert_eq!(tree.lineage(detached), [detached]);
+    assert!(tree.is_lineage_match(detached, &[MatchRule::equals("orphan")]));
+    assert!(!tree.is_lineage_match(detached, &[MatchRule::equals("other")]));
+    assert!(!tree.is_lineage_match(detached, &[]));
+    assert!(!tree.is_lineage_match(
+        detached,
+        &[MatchRule::equals("root"), MatchRule::equals("orphan")]
+    ));
+
+    // A chain that dangles on a stale id keeps the stale id in the lineage, and a
+    // stale id never matches a rule.
+    let dangling = tree.create_child_unattached(missing(), "dangling");
+    assert_eq!(tree.lineage(dangling), [missing(), dangling]);
+    assert!(!tree.is_lineage_match(dangling, &[MatchRule::equals("dangling")]));
+    assert!(!tree.is_lineage_match(
+        dangling,
+        &[MatchRule::equals("dangling"), MatchRule::equals("dangling")]
+    ));
+}
+
+#[test]
+fn set_order_weight_without_ordering_rules_leaves_weights_untouched() {
+    let mut tree = Tree::default();
+    let root = tree.root;
+    let ids = tree.add_children(root, &["b", "a"]).unwrap();
+    tree.arena[ids[1]].order_weight = -5;
+    assert!(tree.driver.rules.ordering.is_empty());
+    tree.set_order_weight();
+    assert_eq!(tree.arena[ids[0]].order_weight, 0);
+    assert_eq!(tree.arena[ids[1]].order_weight, -5);
+    assert_eq!(tree.sorted_children(root), [ids[1], ids[0]]);
 }
 
 #[test]

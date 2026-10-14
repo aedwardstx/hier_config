@@ -135,3 +135,21 @@ fn hierarchical_set_conversion_handles_siblings_and_preformatted_commands() {
         );
     }
 }
+
+#[test]
+fn per_line_sub_rules_see_the_text_left_by_earlier_rules() {
+    let driver = Driver {
+        rules: serde_json::from_value(json!({
+            "per_line_sub": [
+                {"search": "^drop me$", "replace": ""},
+                {"search": "^$", "replace": "refilled"},
+                {"search": "^keep", "replace": "kept"},
+                {"search": "^keep", "replace": "never"}
+            ]
+        }))
+        .unwrap(),
+        ..Driver::default()
+    };
+    let parsed = parse_tree(driver, "drop me\nkeep this\n").unwrap();
+    assert_eq!(parsed.dump_simple(false), ["refilled", "kept this"]);
+}

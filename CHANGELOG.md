@@ -30,14 +30,17 @@ v4 design decisions, for the record:
 
 ### Added
 
+- Acceptance and unit test suites asserting full Unicode (UTF-8, multi-byte, CJK,
+  emoji, Cyrillic) support across both native Rust entrypoints and Python facades,
+  including text parsing, lines ingestion, structured formats (JSON, XML), views,
+  and remediation workflows. (#302)
 - Criterion benchmarks for the Rust core in
   `crates/hier_config_core/benches/workflows.rs` (`cargo bench -p
   hier_config_core --bench workflows`). They cover parsing, deepcopy,
   remediation, rollback, future, traversal, dump, merge, unified diff and
   difference on the same generated configs as the Python benchmarks, including
   non-ASCII workloads, and support saved baselines for before/after
-  comparisons. `criterion` is a dev-dependency only. (#TBD)
-
+  comparisons. `criterion` is a dev-dependency only. (#302)
 - `NodeComments`, a public set-like view over one node's comments, returned by
   `HConfigChild.comments`. It exposes the full mutable-set API (`add`,
   `discard`, `remove`, `pop`, `update`, `clear`, `copy`, the algebra operators
@@ -238,22 +241,53 @@ v4 design decisions, for the record:
 
 ### Changed
 
-- Rust core performance pass, with no public API change. Remediation and
-  rollback no longer rescan a section to drop temporary children: 75–88% faster
-  on wide sections. Rule regexes that need backtracking (lookaround, atomic
-  groups, `\b`) are guarded by a linear prefilter: IOS-XR parsing is 68% faster.
-  `splitlines` scans a word at a time, each new child's text is hashed once, and
-  small sections index their children without hashing: IOS parsing is 31–38%
-  faster and future projection 42% faster. One behaviour change: a line that the
-  prefilter rejects returns "no match" instead of a backtrack-limit error.
-  Measurements are in `docs/dev/benchmarks.md` (Pass 6). (#TBD)
-
+- Line splitting jumps straight to the first candidate byte of each
+  eight-byte word instead of re-scanning it byte by byte, cutting
+  `splitlines()` time by roughly a third on IOS and XR configurations
+  (about 3% of total parse time). It stays pure integer code with no
+  new dependencies; portable SIMD (`std::simd`, `fearless_simd`) was
+  evaluated and measured no faster for these per-line scans.
+- Future/rollback projection skips the source pre-pass when there are no
+  replacement-negation rules and matches prefix
+  negations without temporary strings. The exact negated-counterpart lookup
+  reuses one string buffer per section instead of formatting a new key per line.
+  Benchmarks cover future/rollback round trips and flat-addition scaling. (#302)
+- Remediation builds each matched section's changes in a detached node and
+  attaches it only when it has changes, instead of adding it to the delta and
+  deleting it again. Deleting a child rebuilt the parent's text index, so
+  unchanged sections cost O(n) each; rollback and small-diff remediation are
+  roughly 70–80% faster on the benchmark configs. `difference()` builds
+  matched sections the same way. (#302)
+- Lookaround regexes, such as Cisco IOS-XR's `indent_adjust` start expression,
+  are checked first against a linear-time version of the pattern with the
+  lookarounds removed. Lines that cannot match skip the backtracking engine,
+  which made parsing the 10k-line IOS-XR benchmark config about 60% faster. (#302)
+- Refreshed the 3.x-versus-4.0 comparison in
+  [Performance & Benchmarks](docs/dev/benchmarks.md) with new measurements
+  against hier-config 3.7.0, adding IOS-XR parse, `future()` and rollback rows
+  and documenting the methodology. (#302)
+- The parser sizes its node arena from the input's byte length instead of a
+  second line-splitting pass. Set-command conversion
+  borrows ancestor text instead of copying it. (#302)
+- Parsing is about 40% faster (the 50k-line IOS benchmark drops from 8.3 ms to
+  4.7 ms). Line splitting, indentation measurement and the whitespace check scan
+  eight bytes at a time, and per-line substitutions consult the rule prefilter
+  once per rewrite. Parents with up to eight children index them in a short
+  list instead of a hash table, and a new child is indexed in a single lookup.
+  Stripping sectional exits visits only parents. (#302)
+- Internal performance work in the Rust core and the PyO3 bindings, with no
+  change to the Python API: `Tree::is_lineage_match` walks the parent chain in
+  reverse instead of materializing the lineage, idempotency checks borrow node
+  paths and return early when the driver has no idempotent-command rules,
+  `remediation` passes children slices instead of collecting them per parent
+  node, and `get_or_create_children_batch` takes the tree lock once per batch
+  rather than once per node. (#302)
 - `HConfig.merge()` and `add_deep_copy_of()` copy subtrees from another tree in
   one native pass instead of recursing through Python per node; merging a
   10k-line IOS config is about 50% faster. Results, comments, tags and the
   `Instance` records appended to `instances` are unchanged, and `HConfig`
-  subclasses that override `add_deep_copy_of` still have it called. (#TBD)
-
+  subclasses that override `add_deep_copy_of` still have it called. Shallow
+  copies of branch nodes also skip the recursive tag walk they discarded. (#302)
 - `HConfigChild.comments` is now a live view over the node's comments rather
   than a detached copy. Mutating the returned object — `child.comments.add(…)`
   — now updates the configuration, where previously the change was silently

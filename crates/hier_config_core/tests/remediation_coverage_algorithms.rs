@@ -1,12 +1,59 @@
+use hier_config_core::arena::NodeId;
 use hier_config_core::remediation::{
     children_equal, config_to_get_to_into, future_with_report, overwrite_with,
     strip_acl_sequence_number,
 };
 use hier_config_core::{Driver, Platform, Tree, parse_tree};
 use serde_json::json;
+use std::sync::Arc;
 
 fn generic(text: &str) -> Tree {
     Tree::from_str(Platform::Generic, text).unwrap()
+}
+
+#[test]
+fn future_negated_counterpart_respects_deferred_child_mapping() {
+    let mut source = generic("");
+    let root = source.root;
+    let child = source.create_child_unattached(root, "no service");
+    let text = Arc::clone(&source.arena[child].text);
+    source.arena[root].children.append(&text, child, false);
+    let changes = generic("service");
+
+    assert_eq!(
+        source.future(&changes, false).unwrap().dump_simple(false),
+        ["service", "no service"]
+    );
+}
+
+#[test]
+fn future_negated_counterpart_matches_exact_text_and_custom_prefix() {
+    let driver = Driver {
+        negation_prefix: "undo ".to_string(),
+        ..Driver::default()
+    };
+    let source = parse_tree(
+        driver.clone(),
+        "undo service longer\nundo service\nundo café\nuntouched",
+    )
+    .unwrap();
+    let changes = parse_tree(driver, "service\ncafé\nnew").unwrap();
+    let (future, report) = future_with_report(&source, &changes, false).unwrap();
+    assert_eq!(
+        future.dump_simple(false),
+        ["new", "undo service longer", "untouched"]
+    );
+    assert!(report.unresolved_negations.is_empty());
+    assert!(report.idempotency_replacements.is_empty());
+    assert_eq!(
+        source.dump_simple(false),
+        [
+            "undo service longer",
+            "undo service",
+            "undo café",
+            "untouched"
+        ]
+    );
 }
 
 #[test]
@@ -240,6 +287,29 @@ fn children_equal_checks_config_and_tags_but_ignores_bookkeeping() {
             "mutation {mutation}"
         );
     }
+}
+
+#[test]
+fn children_equal_compares_child_counts_and_missing_nodes() {
+    // Nodes with different child counts are unequal, and two childless nodes are
+    // equal.
+    let tree = generic("parent\n  child\nleaf");
+    let parent = tree.arena[tree.root].children.get("parent").unwrap();
+    let child = tree.arena[parent].children.get("child").unwrap();
+    let leaf = tree.arena[tree.root].children.get("leaf").unwrap();
+    assert!(!children_equal(&tree, parent, &tree, child));
+    assert!(children_equal(&tree, child, &tree, leaf));
+
+    // A node that is no longer in the arena counts as having no children, matching a
+    // childless live node -- unchanged from when both sides went through
+    // `sorted_children`, which returns an empty list for a missing node.
+    let missing = NodeId {
+        index: 999,
+        generation: 1,
+    };
+    assert!(children_equal(&tree, missing, &tree, missing));
+    assert!(children_equal(&tree, missing, &tree, leaf));
+    assert!(!children_equal(&tree, missing, &tree, parent));
 }
 
 #[test]
