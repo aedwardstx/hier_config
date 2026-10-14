@@ -265,3 +265,67 @@ fn node_equality_compares_effective_fields_and_clone_metadata_is_independent() {
     assert_eq!(decorated.tags(), &BTreeSet::from(["a".into()]));
     assert_eq!(clone.tags(), &BTreeSet::from(["a".into(), "b".into()]));
 }
+
+fn texts(arena: &mut Arena<Node>, count: usize, prefix: &str) -> Vec<NodeId> {
+    (0..count)
+        .map(|i| arena.insert(Node::new(&format!("{prefix}{i}"), None)))
+        .collect()
+}
+
+#[test]
+fn children_index_stays_exact_across_small_and_large_sizes() {
+    for count in [1, 7, 8, 9, 17, 40] {
+        let mut arena = Arena::new();
+        let ids = texts(&mut arena, count, "line ");
+        let duplicate = arena.insert(Node::new("line 0", None));
+        let mut children = Children::new();
+        for &id in &ids {
+            children.append(&arena[id].text, id, true);
+        }
+        children.append(&arena[duplicate].text, duplicate, true);
+        for (i, &id) in ids.iter().enumerate() {
+            assert_eq!(children.get(&format!("line {i}")), Some(id), "{count}");
+        }
+        assert!(!children.contains("line"));
+        let mut keys: Vec<_> = children.keys().map(str::to_owned).collect();
+        keys.sort_unstable();
+        let mut expected: Vec<_> = (0..count).map(|i| format!("line {i}")).collect();
+        expected.sort_unstable();
+        assert_eq!(keys, expected);
+
+        // Representation never leaks into equality, cloning or serialisation.
+        let mut rebuilt = children.clone();
+        rebuilt.rebuild_mapping(&arena);
+        assert_eq!(rebuilt, children);
+        let json = serde_json::to_value(&children).unwrap();
+        assert_eq!(json["mapping"].as_object().unwrap().len(), count);
+        let restored: Children = serde_json::from_value(json).unwrap();
+        assert_eq!(restored, children);
+        assert_eq!(restored.get("line 0"), Some(ids[0]));
+
+        children.delete_by_id(ids[0], &arena);
+        assert_eq!(children.get("line 0"), Some(duplicate));
+        assert_ne!(children, rebuilt);
+    }
+}
+
+#[test]
+fn children_equality_ignores_index_insertion_order() {
+    let mut arena = Arena::new();
+    let ids = texts(&mut arena, 3, "x");
+    let mut forward = Children::new();
+    for &id in &ids {
+        forward.append(&arena[id].text, id, true);
+    }
+    let mut reordered = Children::new();
+    for &id in &ids {
+        reordered.append(&arena[id].text, id, false);
+    }
+    reordered.rebuild_mapping(&arena);
+    assert_eq!(forward, reordered);
+    let mut unindexed = Children::new();
+    for &id in &ids {
+        unindexed.append(&arena[id].text, id, false);
+    }
+    assert_ne!(forward, unindexed);
+}
