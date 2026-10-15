@@ -505,19 +505,16 @@ impl PyHConfig {
         };
 
         let (result, backed) = py.detach(move || {
-            let borrowed: Vec<&str> = if split_text {
-                backed
-                    .iter()
-                    .flat_map(|text| hier_config_core::parser::splitlines(text))
-                    .collect()
-            } else {
-                backed.iter().map(|line| &**line).collect()
-            };
             let result = shared.tree.write_py().and_then(|mut tree| {
-                hier_config_core::parser::load_fast(&mut tree, &borrowed, run_post_load)
-                    .map_err(to_py_err)
+                if split_text {
+                    // Walks the text once, without collecting the lines first.
+                    hier_config_core::parser::load_fast_text(&mut tree, &backed[0], run_post_load)
+                } else {
+                    let borrowed: Vec<&str> = backed.iter().map(|line| &**line).collect();
+                    hier_config_core::parser::load_fast(&mut tree, &borrowed, run_post_load)
+                }
+                .map_err(to_py_err)
             });
-            drop(borrowed);
             (result, backed)
         });
         // Released here, with the GIL held, so the references are dropped directly

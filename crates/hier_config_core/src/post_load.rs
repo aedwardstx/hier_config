@@ -7,6 +7,24 @@ pub use crate::platforms::run_post_load_callbacks;
 
 /// Recursively removes trailing sectional exit lines matching the driver's exit command.
 pub fn delete_sectional_exit_recursive(tree: &mut Tree) {
+    // Every exit text a rule (or the platform default) can resolve to. A parent
+    // whose last child is none of them keeps it whatever its lineage, so the
+    // lineage rules only run for the few parents that do end in one.
+    let exit_texts: Vec<String> = tree
+        .driver
+        .possible_sectional_exit_texts()
+        .map(str::to_owned)
+        .collect();
+    let ends_in_exit = |owner: &Tree, id: NodeId| {
+        owner.arena[id]
+            .children
+            .as_slice()
+            .last()
+            .is_some_and(|&last| {
+                let text = owner.arena[last].text.as_ref();
+                exit_texts.iter().any(|exit| exit == text)
+            })
+    };
     // Only parents can end in an exit line, so leaves are never visited.
     let has_children = |owner: &Tree, id: NodeId| !owner.arena[id].children.is_empty();
     let mut parents: Vec<NodeId> = tree.arena[tree.root]
@@ -15,7 +33,9 @@ pub fn delete_sectional_exit_recursive(tree: &mut Tree) {
         .filter(|&child| has_children(tree, child))
         .collect();
     while let Some(node_id) = parents.pop() {
-        tree.delete_sectional_exit(node_id);
+        if ends_in_exit(tree, node_id) {
+            tree.delete_sectional_exit(node_id);
+        }
         let children = tree.arena[node_id].children.iter();
         parents.extend(children.filter(|&child| has_children(tree, child)));
     }
@@ -84,6 +104,52 @@ mod tests {
             .map(|i| format!("{}-{}", i * 999_999, (i + 1) * 999_999 - 1))
             .collect();
         assert!(hp_procurve_expand_range(&segments.join(",")).is_err());
+    }
+
+    #[test]
+    fn sectional_exits_are_deleted_only_where_the_lineage_rules_resolve_them() {
+        let mut driver = crate::driver::Driver::for_platform(Platform::Generic);
+        driver.rules.sectional_exiting = serde_json::from_str(
+            r#"[
+                {"match_rules": [{"startswith": "keep"}], "exit_text": ""},
+                {"match_rules": [{"startswith": "policy"}], "exit_text": "end-policy"},
+                {"match_rules": [{"startswith": "plain"}], "exit_text": "exit"}
+            ]"#,
+        )
+        .unwrap();
+        let mut tree = Tree::new(driver);
+        crate::parser::parse_into_tree(
+            &mut tree,
+            "keep\n a\n exit\npolicy\n a\n end-policy\npolicy two\n a\n exit\n\
+             other\n a\n exit\nplain\n a\n end-policy\n",
+        )
+        .unwrap();
+        delete_sectional_exit_recursive(&mut tree);
+        assert_eq!(
+            tree.dump_simple(false),
+            [
+                "keep",
+                "  a",
+                "  exit",
+                "policy",
+                "  a",
+                "policy two",
+                "  a",
+                "  exit",
+                "other",
+                "  a",
+                "plain",
+                "  a",
+                "  end-policy",
+            ]
+        );
+
+        let huawei = Tree::from_str(Platform::HuaweiVrp, "aaa\n a\n quit\nbbb\n b\n exit\n")
+            .expect("parse error");
+        assert_eq!(
+            huawei.dump_simple(false),
+            ["aaa", "  a", "bbb", "  b", "  exit"]
+        );
     }
 
     #[test]

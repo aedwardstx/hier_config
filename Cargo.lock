@@ -379,6 +379,7 @@ version = "4.0.0-b4"
 dependencies = [
  "criterion",
  "fancy-regex",
+ "mimalloc",
  "proptest",
  "quick-xml",
  "regex",

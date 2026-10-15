@@ -260,3 +260,5 @@ criterion_group! {
     targets = bench_parse, bench_tree, bench_remediation, bench_diff
 }
 criterion_main!(benches);
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;

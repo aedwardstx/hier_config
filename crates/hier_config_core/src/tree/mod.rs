@@ -342,12 +342,53 @@ impl Tree {
         return_if_present: bool,
     ) -> Result<NodeId, TreeError> {
         let trimmed = self.validated_child_text(parent_id, text)?;
+        let indent = self.child_indent(parent_id);
         self.add_validated_child(
             parent_id,
-            &Arc::from(trimmed),
+            Arc::from(trimmed),
+            indent,
             check_if_present,
             return_if_present,
         )
+    }
+
+    /// [`Tree::add_child`] for the parser's per-line hot path.
+    ///
+    /// `make_text` receives the child's position under `parent_id` and returns
+    /// its text, which the parser has already trimmed. The new node's
+    /// `real_indent_level` is `indent`. The parent is looked up once to
+    /// validate and once to index and append the child, instead of per step,
+    /// and the depth walk is skipped for parents within one level of the root.
+    pub(crate) fn add_parsed_child(
+        &mut self,
+        parent_id: NodeId,
+        indent: i32,
+        make_text: impl FnOnce(usize) -> Arc<str>,
+    ) -> Result<NodeId, TreeError> {
+        let root = self.root;
+        let Some(parent) = self.arena.get(parent_id) else {
+            return Err(TreeError::InvalidParent(parent_id));
+        };
+        let position = parent.children.len();
+        let shallow = parent_id == root || parent.parent == Some(root);
+        let text = make_text(position);
+        debug_assert_eq!(text.as_ref(), text.trim());
+        if text.is_empty() {
+            return Err(TreeError::EmptyText);
+        }
+        if !shallow && self.depth_at_least(parent_id, MAX_TREE_DEPTH) {
+            return Err(TreeError::MaxDepthExceeded(MAX_TREE_DEPTH));
+        }
+
+        let predicted = self.arena.next_id();
+        let children = &mut self.arena[parent_id].children;
+        if children.claim(&text, predicted).is_none() {
+            children.push_claimed(predicted);
+            let child_id = self.insert_child_node(parent_id, text, indent);
+            debug_assert_eq!(child_id, predicted);
+            return Ok(child_id);
+        }
+        self.add_validated_child(parent_id, text, indent, true, false)
     }
 
     /// [`Tree::add_child`] for text already held in an `Arc`, which the new
@@ -365,37 +406,52 @@ impl Tree {
         } else {
             Arc::from(trimmed)
         };
-        self.add_validated_child(parent_id, &shared, check_if_present, return_if_present)
+        let indent = self.child_indent(parent_id);
+        self.add_validated_child(
+            parent_id,
+            shared,
+            indent,
+            check_if_present,
+            return_if_present,
+        )
     }
 
+    /// Links a new child carrying `shared` under `parent_id`.
+    ///
+    /// Takes the text by value and moves it into the node, so the only extra
+    /// reference is the parent's index entry; borrowing it would cost a further
+    /// reference-count increment and decrement for every parsed line.
     fn add_validated_child(
         &mut self,
         parent_id: NodeId,
-        shared: &Arc<str>,
+        shared: Arc<str>,
+        indent: i32,
         check_if_present: bool,
         return_if_present: bool,
     ) -> Result<NodeId, TreeError> {
+        let predicted = self.arena.next_id();
         if !check_if_present {
-            let child_id = self.insert_child_node(parent_id, shared);
             self.arena[parent_id]
                 .children
-                .append(shared, child_id, true);
+                .append(&shared, predicted, true);
+            let child_id = self.insert_child_node(parent_id, shared, indent);
+            debug_assert_eq!(child_id, predicted);
             return Ok(child_id);
         }
 
-        let predicted = self.arena.next_id();
-        let Some(existing_id) = self.arena[parent_id].children.claim(shared, predicted) else {
-            let child_id = self.insert_child_node(parent_id, shared);
+        let Some(existing_id) = self.arena[parent_id].children.claim(&shared, predicted) else {
+            let child_id = self.insert_child_node(parent_id, shared, indent);
             debug_assert_eq!(child_id, predicted);
             self.arena[parent_id].children.push_claimed(child_id);
             return Ok(child_id);
         };
 
         if self.is_duplicate_child_allowed(parent_id) {
-            let child_id = self.insert_child_node(parent_id, shared);
             self.arena[parent_id]
                 .children
-                .append(shared, child_id, false);
+                .append(&shared, predicted, false);
+            let child_id = self.insert_child_node(parent_id, shared, indent);
+            debug_assert_eq!(child_id, predicted);
             return Ok(child_id);
         }
         if return_if_present {
@@ -413,6 +469,12 @@ impl Tree {
         text: &'t str,
     ) -> Result<&'t str, TreeError> {
         let trimmed = text.trim();
+        self.validate_child(parent_id, trimmed)?;
+        Ok(trimmed)
+    }
+
+    /// Checks that already-trimmed `trimmed` can become a child of `parent_id`.
+    fn validate_child(&self, parent_id: NodeId, trimmed: &str) -> Result<(), TreeError> {
         if trimmed.is_empty() {
             return Err(TreeError::EmptyText);
         }
@@ -427,15 +489,20 @@ impl Tree {
         if self.depth_at_least(parent_id, MAX_TREE_DEPTH) {
             return Err(TreeError::MaxDepthExceeded(MAX_TREE_DEPTH));
         }
-        Ok(trimmed)
+        Ok(())
     }
 
     /// Inserts a node whose parent is `parent_id` without linking it into the
-    /// parent's children.
-    fn insert_child_node(&mut self, parent_id: NodeId, text: &Arc<str>) -> NodeId {
-        let mut node = Node::from_shared_text(Arc::clone(text), Some(parent_id));
-        node.real_indent_level = self.arena[parent_id].real_indent_level + 1;
+    /// parent's children, at `real_indent_level` `indent`.
+    fn insert_child_node(&mut self, parent_id: NodeId, text: Arc<str>, indent: i32) -> NodeId {
+        let mut node = Node::from_shared_text(text, Some(parent_id));
+        node.real_indent_level = indent;
         self.arena.insert(node)
+    }
+
+    /// The `real_indent_level` of a new child of `parent_id`.
+    fn child_indent(&self, parent_id: NodeId) -> i32 {
+        self.arena[parent_id].real_indent_level + 1
     }
 
     /// Appends a child sharing `text` to `parent_id` without a duplicate check,
@@ -448,10 +515,11 @@ impl Tree {
         text: &Arc<str>,
     ) -> Result<NodeId, TreeError> {
         let trimmed = self.validated_child_text(parent_id, text)?;
+        let indent = self.child_indent(parent_id);
         let child_id = if trimmed.len() == text.len() {
-            self.insert_child_node(parent_id, text)
+            self.insert_child_node(parent_id, Arc::clone(text), indent)
         } else {
-            self.insert_child_node(parent_id, &Arc::from(trimmed))
+            self.insert_child_node(parent_id, Arc::from(trimmed), indent)
         };
         self.attach_child(parent_id, child_id);
         Ok(child_id)
@@ -1659,11 +1727,15 @@ impl Tree {
         if !self.arena.contains(node_id) {
             return;
         }
-        if let Some(last_id) = self.arena[node_id].children.as_slice().last().copied()
-            && let Some(exit_text) = self.sectional_exit(node_id)
-            && self.arena.contains(last_id)
-            && self.arena[last_id].text.as_ref() == exit_text
-        {
+        let Some(last_id) = self.arena[node_id].children.as_slice().last().copied() else {
+            return;
+        };
+        let is_exit = self.arena.contains(last_id)
+            && self
+                .driver
+                .sectional_exit_line(true, |rules| self.is_lineage_match(node_id, rules))
+                .is_some_and(|(exit_text, _)| self.arena[last_id].text.as_ref() == exit_text);
+        if is_exit {
             self.delete_child(last_id);
         }
     }

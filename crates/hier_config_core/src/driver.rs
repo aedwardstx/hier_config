@@ -504,6 +504,24 @@ impl Driver {
             .map(|(text, _)| text.to_string())
     }
 
+    /// Every text [`Self::sectional_exit_line`] can return, in rule order, possibly
+    /// with repeats.
+    pub fn possible_sectional_exit_texts(&self) -> impl Iterator<Item = &str> {
+        let default = crate::platforms::default_sectional_exit(self.platform);
+        self.rules
+            .sectional_exiting
+            .iter()
+            .filter(|rule| !rule.exit_text.is_empty())
+            .map(move |rule| {
+                if rule.exit_text == "exit" {
+                    default
+                } else {
+                    rule.exit_text.as_str()
+                }
+            })
+            .chain(std::iter::once(default))
+    }
+
     /// Like [`Self::sectional_exit`], borrowing the exit text and also returning
     /// whether it renders at the parent's indentation level.
     ///

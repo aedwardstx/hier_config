@@ -152,6 +152,12 @@ impl HashedIndex {
     }
 
     fn insert_first(&mut self, text: &Arc<str>, id: NodeId) -> Option<NodeId> {
+        // Indexes this large belong to the few sections holding most of a
+        // configuration, which keep growing; quadrupling instead of doubling
+        // halves the number of rehashes on the way there.
+        if self.table.len() == self.table.capacity() {
+            self.table.reserve(self.table.len() * 3);
+        }
         let key = HashedKey {
             hash: self.state.hash_one(&**text),
             text: Arc::clone(text),
@@ -178,17 +184,71 @@ impl HashedIndex {
     }
 }
 
+/// Up to [`LINEAR_INDEX_MAX`] index entries stored inline, filled from the front.
+///
+/// Held inline in the boxed [`Index`] rather than in a `Vec`, so a small parent's
+/// index is one allocation instead of two. Most branches in a parsed tree have
+/// such an index, and each extra allocation is also an extra free on drop.
+#[derive(Debug, Clone)]
+struct LinearIndex {
+    entries: [Option<(Arc<str>, NodeId)>; LINEAR_INDEX_MAX],
+    /// Number of filled slots; `Children::get_at` reads it on every lookup.
+    len: usize,
+}
+
+impl LinearIndex {
+    const fn new() -> Self {
+        Self {
+            entries: [const { None }; LINEAR_INDEX_MAX],
+            len: 0,
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &(Arc<str>, NodeId)> {
+        self.entries[..self.len].iter().filter_map(Option::as_ref)
+    }
+
+    const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Stores `entry` in the first free slot, handing it back when full.
+    fn push(&mut self, entry: (Arc<str>, NodeId)) -> Result<(), (Arc<str>, NodeId)> {
+        match self.entries.get_mut(self.len) {
+            Some(slot) => {
+                *slot = Some(entry);
+                self.len += 1;
+                Ok(())
+            }
+            None => Err(entry),
+        }
+    }
+
+    /// Removes the entry at `position`, keeping the rest packed and in order.
+    fn remove(&mut self, position: usize) {
+        self.entries[position] = None;
+        self.entries[position..self.len].rotate_left(1);
+        self.len -= 1;
+    }
+
+    /// Empties the index, yielding its entries in order.
+    fn drain(&mut self) -> impl Iterator<Item = (Arc<str>, NodeId)> + '_ {
+        let len = std::mem::take(&mut self.len);
+        self.entries[..len].iter_mut().filter_map(Option::take)
+    }
+}
+
 /// Text index behind [`Children`], sized to the number of indexed children.
 #[derive(Debug, Clone)]
 enum Index {
-    Linear(Vec<(Arc<str>, NodeId)>),
+    Linear(LinearIndex),
     Hashed(HashedIndex),
 }
 
 impl Index {
-    /// An empty index, sized so it never regrows before promotion.
-    fn new() -> Self {
-        Self::Linear(Vec::with_capacity(LINEAR_INDEX_MAX))
+    /// An empty index.
+    const fn new() -> Self {
+        Self::Linear(LinearIndex::new())
     }
 
     fn get(&self, text: &str) -> Option<NodeId> {
@@ -209,12 +269,11 @@ impl Index {
                 if let Some(&(_, existing)) = entries.iter().find(|(key, _)| key == text) {
                     return Some(existing);
                 }
-                if entries.len() < LINEAR_INDEX_MAX {
-                    entries.push((Arc::clone(text), id));
+                let Err(_) = entries.push((Arc::clone(text), id)) else {
                     return None;
-                }
+                };
                 let mut index = HashedIndex::with_capacity(LINEAR_INDEX_MAX * 2);
-                for (key, existing) in entries.drain(..) {
+                for (key, existing) in entries.drain() {
                     index.insert_first(&key, existing);
                 }
                 index.insert_first(text, id);
@@ -229,10 +288,10 @@ impl Index {
     fn remove_if(&mut self, text: &str, id: NodeId) {
         match self {
             Self::Linear(entries) => {
-                if let Some(position) = entries
+                let position = entries
                     .iter()
-                    .position(|(key, existing)| *existing == id && key.as_ref() == text)
-                {
+                    .position(|(key, existing)| *existing == id && key.as_ref() == text);
+                if let Some(position) = position {
                     entries.remove(position);
                 }
             }
@@ -249,8 +308,11 @@ impl Index {
 
     fn from_mapping(mapping: Mapping) -> Self {
         if mapping.len() <= LINEAR_INDEX_MAX {
-            let mut entries = Vec::with_capacity(LINEAR_INDEX_MAX);
-            entries.extend(mapping);
+            let mut entries = LinearIndex::new();
+            for entry in mapping {
+                let pushed = entries.push(entry);
+                debug_assert!(pushed.is_ok(), "mapping fits the linear index");
+            }
             Self::Linear(entries)
         } else {
             let mut index = HashedIndex::with_capacity(mapping.len());
@@ -516,6 +578,75 @@ impl Children {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn id(index: u32) -> NodeId {
+        NodeId {
+            index,
+            generation: 1,
+        }
+    }
+
+    #[test]
+    fn linear_index_stays_packed_and_ordered_through_removals() {
+        let texts: Vec<Arc<str>> = (0..LINEAR_INDEX_MAX)
+            .map(|i| Arc::from(format!("line {i}")))
+            .collect();
+        let mut index = Index::new();
+        for (i, text) in (0..).zip(&texts) {
+            assert_eq!(index.insert_first(text, id(i)), None);
+        }
+        assert!(matches!(index, Index::Linear(_)));
+        index.remove_if("line 3", id(99));
+        assert_eq!(index.len(), LINEAR_INDEX_MAX);
+        index.remove_if("line 3", id(3));
+        index.remove_if("line 0", id(0));
+        assert_eq!(
+            index.keys().collect::<Vec<_>>(),
+            ["line 1", "line 2", "line 4", "line 5", "line 6", "line 7"]
+        );
+        assert_eq!(index.insert_first(&texts[1], id(50)), Some(id(1)));
+        assert_eq!(index.insert_first(&texts[0], id(60)), None);
+        assert_eq!(index.get("line 0"), Some(id(60)));
+        assert_eq!(index.get("line 7"), Some(id(7)));
+        assert!(matches!(index, Index::Linear(_)));
+    }
+
+    #[test]
+    fn linear_index_promotes_to_hashed_when_full() {
+        let texts: Vec<Arc<str>> = (0..LINEAR_INDEX_MAX)
+            .map(|i| Arc::from(format!("line {i}")))
+            .collect();
+        let mut index = Index::new();
+        for (i, text) in (0..).zip(&texts) {
+            assert_eq!(index.insert_first(text, id(i)), None);
+        }
+        index.remove_if("line 3", id(3));
+        assert_eq!(index.insert_first(&texts[3], id(30)), None);
+        let extra: Arc<str> = Arc::from("line 8");
+        assert!(matches!(index, Index::Linear(_)));
+        assert_eq!(index.insert_first(&extra, id(8)), None);
+        assert!(matches!(index, Index::Hashed(_)));
+        assert_eq!(index.len(), LINEAR_INDEX_MAX + 1);
+        for (i, text) in (0..).zip(&texts) {
+            let expected = if i == 3 { id(30) } else { id(i) };
+            assert_eq!(index.get(text), Some(expected));
+        }
+    }
+
+    #[test]
+    fn hashed_index_keeps_first_entries_while_growing() {
+        let texts: Vec<Arc<str>> = (0..300).map(|i| Arc::from(format!("line {i}"))).collect();
+        let mut index = HashedIndex::with_capacity(1);
+        for (i, text) in (0..).zip(&texts) {
+            assert_eq!(index.insert_first(text, id(i)), None);
+            assert_eq!(index.insert_first(text, id(i + 1000)), Some(id(i)));
+        }
+        assert_eq!(index.table.len(), texts.len());
+        for (i, text) in (0..).zip(&texts) {
+            assert_eq!(index.get(text), Some(id(i)));
+        }
+        assert_eq!(index.get("line 300"), None);
+    }
 
     #[test]
     fn stored_hash_uses_the_written_hash_and_folds_other_bytes() {

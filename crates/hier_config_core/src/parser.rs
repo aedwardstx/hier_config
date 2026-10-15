@@ -8,13 +8,367 @@ use rustc_hash::FxHashSet as HashSet;
 use std::borrow::Cow;
 use std::sync::Arc;
 
+/// The ASCII bytes allowed at one position of a [`PrefixGuard`], as a bitmask.
+type ByteClass = u128;
+
+/// Whether `byte` stands for itself in a pattern, inside `[...]` and out.
+///
+/// Deliberately narrow: anything with a meaning in either context simply ends
+/// the guard.
+const fn is_plain_literal(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b' ' | b'!'
+                | b'"'
+                | b'#'
+                | b'%'
+                | b'\''
+                | b','
+                | b'/'
+                | b':'
+                | b';'
+                | b'<'
+                | b'='
+                | b'>'
+                | b'@'
+                | b'_'
+                | b'`'
+        )
+}
+
+/// Whether `byte` stands for itself outside a class; `-`, `&` and `~` only have a
+/// meaning (ranges and set operators) inside one.
+const fn is_plain_literal_outside_class(byte: u8) -> bool {
+    is_plain_literal(byte) || matches!(byte, b'-' | b'&' | b'~')
+}
+
+/// The literal start that every match of an anchored rule pattern must have.
+///
+/// `per_line_sub` rules are almost always `^literal...` or `^\s*[chars]...`. For
+/// such a pattern a line can only match if it begins with those bytes (after any
+/// leading whitespace, for `\s*`), which a few byte comparisons decide. The guard
+/// is a necessary condition only — a line it admits still runs the real regex —
+/// so skipping a rule it rejects never changes the result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PrefixGuard {
+    /// The pattern starts `^\s*`, so the prefix follows any leading whitespace.
+    skip_whitespace: bool,
+    classes: Vec<ByteClass>,
+    /// What follows the prefix when the guard spells out the entire pattern.
+    tail: Option<GuardTail>,
+}
+
+/// The remainder of a pattern that a [`PrefixGuard`] fully describes.
+///
+/// With one of these the guard decides the match outright, not just a necessary
+/// condition, so the substitution needs no regex at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuardTail {
+    /// Nothing: the match is the prefix itself.
+    Open,
+    /// `.*` or `.*$`: the match runs to the end of a single line.
+    RestOfLine,
+    /// `$`: the line must end right after the prefix.
+    EndOfLine,
+}
+
+impl PrefixGuard {
+    /// Derives the guard for `pattern`, or `None` when no literal start can be
+    /// read off it with certainty.
+    fn of(pattern: &str) -> Option<Self> {
+        let rest = pattern.strip_prefix('^')?;
+        // A top-level alternative need not be anchored at all.
+        if pattern.contains('|') {
+            return None;
+        }
+        let (skip_whitespace, rest) = rest
+            .strip_prefix(r"\s*")
+            .map_or((false, rest), |after| (true, after));
+        let bytes = rest.as_bytes();
+        let mut classes = Vec::new();
+        let mut index = 0;
+        let mut quantified = false;
+        while let Some(&byte) = bytes.get(index) {
+            let (class, next) = if byte == b'[' {
+                let Some(class) = Self::class_at(bytes, index + 1) else {
+                    break;
+                };
+                class
+            } else if is_plain_literal_outside_class(byte) {
+                (1 << byte, index + 1)
+            } else {
+                break;
+            };
+            match bytes.get(next) {
+                // The element may be absent, so nothing from here on is certain.
+                Some(b'*' | b'?' | b'{') => {
+                    quantified = true;
+                    break;
+                }
+                Some(b'+') => {
+                    classes.push(class);
+                    quantified = true;
+                    break;
+                }
+                _ => classes.push(class),
+            }
+            index = next;
+        }
+        let tail = if quantified {
+            None
+        } else {
+            match &rest[index..] {
+                "" => Some(GuardTail::Open),
+                ".*" | ".*$" => Some(GuardTail::RestOfLine),
+                "$" => Some(GuardTail::EndOfLine),
+                _ => None,
+            }
+        };
+        // `\s*` would also consume a leading whitespace byte the guard demands.
+        let whitespace: ByteClass = (1 << b' ') | (0x3e00); // space, \t..\r
+        if skip_whitespace && classes.first().is_some_and(|class| class & whitespace != 0) {
+            return None;
+        }
+        (!classes.is_empty()).then_some(Self {
+            skip_whitespace,
+            classes,
+            tail,
+        })
+    }
+
+    /// Parses a plain `[...]` class whose body starts at `start`, returning it
+    /// and the index after the closing bracket.
+    fn class_at(bytes: &[u8], start: usize) -> Option<(ByteClass, usize)> {
+        let mut class: ByteClass = 0;
+        for (offset, &byte) in bytes.get(start..)?.iter().enumerate() {
+            if byte == b']' {
+                return (class != 0).then_some((class, start + offset + 1));
+            }
+            if !is_plain_literal(byte) {
+                return None;
+            }
+            class |= 1 << byte;
+        }
+        None
+    }
+
+    /// Bytes of `text` the guard's first class applies to.
+    fn start<'a>(&self, text: &'a str) -> &'a [u8] {
+        let bytes = text.as_bytes();
+        if self.skip_whitespace {
+            &bytes[leading_whitespace_len(text)..]
+        } else {
+            bytes
+        }
+    }
+
+    /// Substitutes `replacement` for the rule's match in `text` without a regex,
+    /// if the guard describes the whole pattern and `replacement` is literal.
+    ///
+    fn substitute(&self, text: &str, replacement: &str) -> Substitution {
+        let Some(tail) = self.tail else {
+            return Substitution::Undecided;
+        };
+        if !self.admits(text) {
+            return Substitution::NoMatch;
+        }
+        if replacement.contains('$') || text.contains('\n') {
+            return Substitution::Undecided;
+        }
+        let matched = text.len() - self.start(text).len() + self.classes.len();
+        match tail {
+            GuardTail::Open => Substitution::Replaced([replacement, &text[matched..]].concat()),
+            GuardTail::RestOfLine => Substitution::Replaced(replacement.to_owned()),
+            GuardTail::EndOfLine if matched == text.len() => {
+                Substitution::Replaced(replacement.to_owned())
+            }
+            GuardTail::EndOfLine => Substitution::NoMatch,
+        }
+    }
+
+    /// Returns false only when the rule cannot match `text`.
+    fn admits(&self, text: &str) -> bool {
+        let bytes = self.start(text);
+        bytes.len() >= self.classes.len()
+            && self
+                .classes
+                .iter()
+                .zip(bytes)
+                .all(|(class, &byte)| byte < 128 && class >> byte & 1 == 1)
+    }
+}
+
+/// Outcome of [`PrefixGuard::substitute`].
+#[derive(Debug, PartialEq, Eq)]
+enum Substitution {
+    /// The guard alone cannot decide; the regex must run.
+    Undecided,
+    /// The rule provably does not match.
+    NoMatch,
+    /// The rule matches and produces this text.
+    Replaced(String),
+}
+
+/// Per-position byte tables for a group of guarded rules.
+///
+/// `allowed[k][byte]` holds the rules whose guard accepts `byte` at offset `k`,
+/// including every rule whose guard is shorter than `k + 1` bytes; `ended[k]`
+/// holds the rules whose guard is at most `k` bytes long, which are the only ones a
+/// text ending at offset `k` can still satisfy. `AND`ing the entries for a line's
+/// first bytes leaves exactly the rules whose first [`PrefixTables::DEPTH`] guard
+/// bytes the line matches, so most lines are dismissed after two or three lookups.
+struct PrefixTables {
+    rules: u64,
+    allowed: Box<[[u64; 256]; Self::DEPTH]>,
+    ended: [u64; Self::DEPTH],
+}
+
+impl PrefixTables {
+    /// Number of leading bytes tabulated.
+    const DEPTH: usize = 8;
+
+    fn new() -> Self {
+        Self {
+            rules: 0,
+            allowed: Box::new([[0; 256]; Self::DEPTH]),
+            ended: [0; Self::DEPTH],
+        }
+    }
+
+    fn add(&mut self, rule: usize, guard: &PrefixGuard) {
+        let bit = 1 << rule;
+        self.rules |= bit;
+        for (position, table) in self.allowed.iter_mut().enumerate() {
+            let Some(&class) = guard.classes.get(position) else {
+                self.ended[position] |= bit;
+                for entry in table.iter_mut() {
+                    *entry |= bit;
+                }
+                continue;
+            };
+            for (byte, entry) in table.iter_mut().enumerate().take(128) {
+                if class >> byte & 1 == 1 {
+                    *entry |= bit;
+                }
+            }
+        }
+    }
+
+    /// The rules whose leading guard bytes `bytes` matches.
+    fn candidates(&self, bytes: &[u8]) -> u64 {
+        let mut mask = self.rules;
+        for (position, table) in self.allowed.iter().enumerate() {
+            let Some(&byte) = bytes.get(position) else {
+                return mask & self.ended[position];
+            };
+            mask &= table[usize::from(byte)];
+            if mask == 0 {
+                break;
+            }
+        }
+        mask
+    }
+}
+
+/// Selects the rules that could match a line from its first bytes alone.
+///
+/// Guarded rules are filed in [`PrefixTables`] — one for plain `^` rules, one
+/// read after the leading whitespace for `^\s*` rules — so a line pays a few
+/// table lookups rather than a regex scan per rule. Unguarded rules fall back to a
+/// `RegexSet` over just those patterns.
+struct SubDispatch {
+    guards: Vec<Option<PrefixGuard>>,
+    anchored: PrefixTables,
+    after_whitespace: PrefixTables,
+    /// Rules with no guard, as a set over their patterns plus each set entry's rule.
+    unguarded: Option<(Arc<regex::RegexSet>, Vec<usize>)>,
+    /// Unguarded rules that are always candidates because no set could be built.
+    always: u64,
+}
+
+impl SubDispatch {
+    /// Widest rule list the `u64` candidate masks can describe.
+    const MAX_RULES: usize = 64;
+
+    fn new(rules: &[(Arc<Regex>, String)]) -> Option<Self> {
+        if rules.len() > Self::MAX_RULES {
+            return None;
+        }
+        let guards: Vec<_> = rules
+            .iter()
+            .map(|(re, _)| PrefixGuard::of(re.as_str()))
+            .collect();
+        let mut anchored = PrefixTables::new();
+        let mut after_whitespace = PrefixTables::new();
+        let mut unguarded_rules = Vec::new();
+        for (rule, guard) in guards.iter().enumerate() {
+            match guard {
+                Some(guard) if guard.skip_whitespace => after_whitespace.add(rule, guard),
+                Some(guard) => anchored.add(rule, guard),
+                None => unguarded_rules.push(rule),
+            }
+        }
+        let (unguarded, always) = if unguarded_rules.is_empty() {
+            (None, 0)
+        } else if let Some(set) = crate::regex_cache::regex_set(
+            unguarded_rules.iter().map(|&rule| rules[rule].0.as_str()),
+        ) {
+            (Some((set, unguarded_rules)), 0)
+        } else {
+            (
+                None,
+                unguarded_rules
+                    .iter()
+                    .fold(0, |mask, rule| mask | 1 << rule),
+            )
+        };
+        Some(Self {
+            guards,
+            anchored,
+            after_whitespace,
+            unguarded,
+            always,
+        })
+    }
+
+    /// Bitmask of the rules that might match `text`, whose leading whitespace is
+    /// `indent` bytes long when the caller already knows it.
+    fn candidates(&self, text: &str, indent: Option<usize>) -> u64 {
+        let bytes = text.as_bytes();
+        let mut mask = self.always | self.anchored.candidates(bytes);
+        if self.after_whitespace.rules != 0 {
+            let indent = indent.unwrap_or_else(|| leading_whitespace_len(text));
+            mask |= self.after_whitespace.candidates(&bytes[indent..]);
+        }
+        if let Some((set, rules)) = &self.unguarded
+            && set.is_match(text)
+        {
+            for entry in &set.matches(text) {
+                mask |= 1 << rules[entry];
+            }
+        }
+        mask
+    }
+}
+
+/// The rewritten text, if a substitution produced one.
+fn owned(text: Cow<'_, str>) -> Option<String> {
+    match text {
+        Cow::Owned(text) => Some(text),
+        Cow::Borrowed(_) => None,
+    }
+}
+
 /// Substitution rules resolved to compiled regexes once, ahead of the line loop.
 ///
 /// Platforms define up to a few dozen `per_line_sub` rules, each of which would
 /// otherwise be looked up in the regex cache — hashing the pattern and taking a
 /// lock — for every line of the configuration.
 struct PreparedSubs {
-    /// Union of every rule pattern, used to reject lines no rule touches in one pass.
+    /// Picks candidate rules per line; `None` only past [`SubDispatch::MAX_RULES`].
+    dispatch: Option<SubDispatch>,
+    /// Union of every rule pattern, used when there is no dispatch table.
     prefilter: Option<Arc<regex::RegexSet>>,
     rules: Vec<(Arc<Regex>, String)>,
 }
@@ -30,19 +384,69 @@ impl PreparedSubs {
             })
             .collect::<Result<_, String>>()
             .map_err(TreeError::InvalidRegex)?;
-        let prefilter = crate::regex_cache::regex_set(rules.iter().map(|(re, _)| re.as_str()));
-        Ok(Self { prefilter, rules })
+        let dispatch = SubDispatch::new(&rules);
+        let prefilter = if dispatch.is_some() {
+            None
+        } else {
+            crate::regex_cache::regex_set(rules.iter().map(|(re, _)| re.as_str()))
+        };
+        Ok(Self {
+            dispatch,
+            prefilter,
+            rules,
+        })
     }
 
     /// Applies every rule in order, allocating only when a rule actually matches.
     ///
-    /// Most configuration lines match none of the rules, so a combined `RegexSet`
-    /// rejects them in a single pass instead of scanning once per rule. For a line that
-    /// does match, the same set reports *which* rules match the current text; a rule
-    /// it excludes provably leaves that text untouched and is skipped without running
-    /// it. After a rule rewrites the text the set is consulted again on the result,
-    /// which keeps the outcome identical to a plain sequential pass.
+    /// Only the rules [`SubDispatch`] selects for the line run, each still checked
+    /// against its full guard first; a rule it rules out provably leaves the text
+    /// untouched. After a rule rewrites the text, the later rules are reselected
+    /// for the result, which keeps the outcome identical to a plain sequential
+    /// pass.
+    #[cfg(test)]
     fn apply<'a>(&self, line: &'a str) -> Cow<'a, str> {
+        self.apply_indented(line, None)
+    }
+
+    /// [`Self::apply`] for a line whose leading whitespace is `indent` bytes long,
+    /// when the caller has already measured it.
+    fn apply_indented<'a>(&self, line: &'a str, indent: Option<usize>) -> Cow<'a, str> {
+        let Some(dispatch) = &self.dispatch else {
+            return self.apply_with_set(line);
+        };
+        let mut text = Cow::Borrowed(line);
+        let mut pending = dispatch.candidates(line, indent);
+        while pending != 0 {
+            let bit = pending.trailing_zeros();
+            let rule = bit as usize;
+            pending &= pending - 1;
+            let (re, replace) = &self.rules[rule];
+            let replaced = match &dispatch.guards[rule] {
+                Some(guard) => match guard.substitute(&text, replace) {
+                    Substitution::Replaced(replaced) => Some(replaced),
+                    Substitution::Undecided if guard.admits(&text) => {
+                        owned(re.replace_all(&text, replace.as_str()))
+                    }
+                    Substitution::NoMatch | Substitution::Undecided => None,
+                },
+                None => owned(re.replace_all(&text, replace.as_str())),
+            };
+            if let Some(replaced) = replaced {
+                text = Cow::Owned(replaced);
+                let later = u64::MAX.checked_shl(bit + 1).unwrap_or(0);
+                pending = dispatch.candidates(&text, None) & later;
+            }
+        }
+        text
+    }
+
+    /// [`Self::apply`] for rule lists too long for [`SubDispatch`].
+    ///
+    /// A combined `RegexSet` rejects most lines in a single pass and, for a line
+    /// that does match, reports which rules match the current text; it is
+    /// consulted again after each rewrite.
+    fn apply_with_set<'a>(&self, line: &'a str) -> Cow<'a, str> {
         let mut text = Cow::Borrowed(line);
         let Some(prefilter) = &self.prefilter else {
             for (re, replace) in &self.rules {
@@ -162,6 +566,19 @@ impl ParserCursor {
         indent: i32,
         line: &str,
     ) -> Result<NodeId, TreeError> {
+        self.record_trimmed_line(tree, indent, line.trim(), &mut SiblingTexts::new())
+    }
+
+    /// [`Self::record_line`] for a line the parser has already trimmed, sharing
+    /// its text with an identical line seen at the same position in an earlier
+    /// section.
+    fn record_trimmed_line(
+        &mut self,
+        tree: &mut Tree,
+        indent: i32,
+        line: &str,
+        texts: &mut SiblingTexts,
+    ) -> Result<NodeId, TreeError> {
         // Walks back up the tree
         while indent <= tree.arena[self.current_section].real_indent_level
             && self.current_section != tree.root
@@ -178,8 +595,15 @@ impl ParserCursor {
             self.current_section = self.most_recent_item;
         }
 
-        let new_child = tree.add_child(self.current_section, line, true, false)?;
-        tree.arena[new_child].real_indent_level = indent;
+        let parent = self.current_section;
+        let at_root = parent == tree.root;
+        let new_child = tree.add_parsed_child(parent, indent, |position| {
+            if at_root {
+                Arc::from(line)
+            } else {
+                texts.share(position, line)
+            }
+        })?;
         self.most_recent_item = new_child;
 
         Ok(new_child)
@@ -189,6 +613,41 @@ impl ParserCursor {
     pub const fn reset_to_root(&mut self, root: NodeId, most_recent_item: NodeId) {
         self.current_section = root;
         self.most_recent_item = most_recent_item;
+    }
+}
+
+/// Recently parsed child texts, keyed by their position within the parent.
+///
+/// Configurations repeat the same lines in every instance of a section (each
+/// interface's `no shutdown`, say). Comparing a line with the text last seen at
+/// its position is a single byte comparison, and on a match the new node shares
+/// that `Arc` instead of allocating, and later freeing, its own copy. Unlike a
+/// hashed intern table this costs nothing for lines that never repeat.
+struct SiblingTexts {
+    slots: [Option<Arc<str>>; Self::POSITIONS],
+}
+
+impl SiblingTexts {
+    /// Positions tracked; later children of large sections rarely repeat.
+    const POSITIONS: usize = 16;
+
+    const fn new() -> Self {
+        Self {
+            slots: [const { None }; Self::POSITIONS],
+        }
+    }
+
+    /// Returns a shared text for `line` as the child at `position`.
+    fn share(&mut self, position: usize, line: &str) -> Arc<str> {
+        let Some(slot) = self.slots.get_mut(position) else {
+            return Arc::from(line);
+        };
+        if let Some(previous) = slot.as_ref().filter(|previous| previous.as_ref() == line) {
+            return Arc::clone(previous);
+        }
+        let text: Arc<str> = Arc::from(line);
+        *slot = Some(Arc::clone(&text));
+        text
     }
 }
 
@@ -265,6 +724,9 @@ fn is_already_normalized(rest: &[u8]) -> bool {
     // Eight bytes at a time: a word of printable ASCII and single spaces needs no
     // per-byte work. Any other byte hands the rest of the line to the exact scan.
     let (words, tail) = rest.as_chunks::<8>();
+    let Some(last) = rest.last_chunk::<8>() else {
+        return is_normalized_from(rest, false);
+    };
     let mut prev_space = false;
     for (position, word) in words.iter().enumerate() {
         let word = u64::from_le_bytes(*word);
@@ -278,7 +740,19 @@ fn is_already_normalized(rest: &[u8]) -> bool {
         }
         prev_space = spaces & LAST != 0;
     }
-    is_normalized_from(tail, prev_space)
+    if tail.is_empty() {
+        return !prev_space;
+    }
+    // Re-read the tail as the line's last eight bytes. They overlap the final full
+    // word, so every adjacent pair the tail adds lies inside this one word and the
+    // byte-at-a-time loop is skipped.
+    let word = u64::from_le_bytes(*last);
+    if (word | word.wrapping_sub(SPACES) & !word) & HIGH != 0 {
+        return is_normalized_from(tail, prev_space);
+    }
+    let not_space = word ^ SPACES;
+    let spaces = !((not_space & LOW).wrapping_add(LOW) | not_space | LOW);
+    spaces & (spaces >> 8 | LAST) == 0
 }
 
 /// Byte-at-a-time form of [`is_already_normalized`], resuming after a space when
@@ -316,6 +790,14 @@ pub(crate) fn leading_whitespace_len(line: &str) -> usize {
     match line.as_bytes().get(spaces) {
         Some(byte) if byte.is_ascii_graphic() => spaces,
         _ => line.len() - line.trim_start().len(),
+    }
+}
+
+/// `str::trim_end` with a shortcut for the usual line ending in printable ASCII.
+fn trim_end(line: &str) -> &str {
+    match line.as_bytes().last() {
+        Some(byte) if byte.is_ascii_graphic() => line,
+        _ => line.trim_end(),
     }
 }
 
@@ -412,9 +894,111 @@ pub const fn splitlines(text: &str) -> SplitLines<'_> {
     SplitLines { rest: Some(text) }
 }
 
-fn normalize_whitespace<'a>(raw_line: &'a str, buffer: &'a mut String) -> &'a str {
+/// Iterator returned by [`parse_lines`].
+#[derive(Debug, Clone)]
+struct ParseLines<'a> {
+    rest: Option<&'a str>,
+}
+
+/// [`splitlines`] fused with the [`normalize_whitespace`] fast-path check.
+///
+/// Each item is a line plus, when the line is already normalized with plain-space
+/// indentation, that indentation's length. Ordinary configuration lines are
+/// therefore read once instead of being scanned for a line boundary and again for
+/// whitespace; any other line yields `None` and is normalized as before.
+const fn parse_lines(text: &str) -> ParseLines<'_> {
+    ParseLines { rest: Some(text) }
+}
+
+impl<'a> Iterator for ParseLines<'a> {
+    type Item = (&'a str, Option<usize>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let rest = self.rest?;
+        let bytes = rest.as_bytes();
+        let (boundary, indent) = match scan_normalized_line(bytes) {
+            Some((index, indent)) => (Some(index), indent),
+            None => (find_line_boundary(bytes).map(|(index, _)| index), None),
+        };
+        let Some(index) = boundary else {
+            self.rest = None;
+            return (!rest.is_empty()).then_some((rest, None));
+        };
+        let width = line_boundary_width(bytes, index).unwrap_or(1);
+        let mut next_start = index + width;
+        if bytes[index] == b'\r' && bytes.get(next_start) == Some(&b'\n') {
+            next_start += 1;
+        }
+        self.rest = Some(&rest[next_start..]);
+        Some((&rest[..index], indent))
+    }
+}
+
+/// Finds the line boundary ending an already-normalized, space-indented line in
+/// one word-at-a-time pass, returning its offset and the indentation length.
+///
+/// Returns `None` whenever the line needs the general path: non-space indentation,
+/// a control or non-ASCII byte before the boundary, doubled or trailing spaces, or
+/// a final line with no boundary at all.
+fn scan_normalized_line(bytes: &[u8]) -> Option<(usize, Option<usize>)> {
+    const SPACES: u64 = u64::from_le_bytes([b' '; 8]);
+    const LOW: u64 = u64::from_le_bytes([0x7f; 8]);
+    const HIGH: u64 = u64::from_le_bytes([0x80; 8]);
+    const LAST: u64 = 0x80 << 56;
+
+    let indent = bytes.iter().take_while(|&&byte| byte == b' ').count();
+    if !bytes.get(indent)?.is_ascii_graphic() {
+        return None;
+    }
+    let mut index = indent;
+    let mut prev_space = false;
+    while let Some(word) = bytes.get(index..index + 8) {
+        let word = u64::from_le_bytes(word.try_into().unwrap_or_default());
+        let not_space = word ^ SPACES;
+        let mut spaces = !((not_space & LOW).wrapping_add(LOW) | not_space | LOW);
+        // Bytes below 0x20 or above 0x7f: every line boundary, and everything else
+        // the normalization check would reject.
+        let special = (word | word.wrapping_sub(SPACES) & !word) & HIGH;
+        let position = (special != 0).then(|| (special.trailing_zeros() / 8) as usize);
+        if let Some(position) = position {
+            spaces &= (1u64 << (position * 8)) - 1;
+        }
+        if spaces & (spaces >> 8 | u64::from(prev_space) << 7) != 0 {
+            return None;
+        }
+        let Some(position) = position else {
+            prev_space = spaces & LAST != 0;
+            index += 8;
+            continue;
+        };
+        if position > 0 {
+            prev_space = spaces >> (position * 8 - 1) & 1 != 0;
+        }
+        let boundary = index + position;
+        line_boundary_width(bytes, boundary)?;
+        return Some((boundary, (!prev_space).then_some(indent)));
+    }
+    // Fewer than eight bytes remain only at the end of the text.
+    for (offset, &byte) in bytes[index..].iter().enumerate() {
+        if byte == b' ' {
+            if prev_space {
+                return None;
+            }
+            prev_space = true;
+        } else if byte.is_ascii_graphic() {
+            prev_space = false;
+        } else {
+            let boundary = index + offset;
+            line_boundary_width(bytes, boundary)?;
+            return Some((boundary, (!prev_space).then_some(indent)));
+        }
+    }
+    None
+}
+
+fn normalize_whitespace<'a>(raw_line: &'a str, buffer: &'a mut String) -> (&'a str, usize) {
     let leading_spaces = leading_whitespace_len(raw_line);
-    if is_already_normalized(&raw_line.as_bytes()[leading_spaces..]) {
+    let normalized = if is_already_normalized(&raw_line.as_bytes()[leading_spaces..]) {
         raw_line
     } else {
         buffer.clear();
@@ -430,7 +1014,10 @@ fn normalize_whitespace<'a>(raw_line: &'a str, buffer: &'a mut String) -> &'a st
             first = false;
         }
         buffer
-    }
+    };
+    // The rebuilt line re-emits one space per byte of the original indentation, so
+    // either way the result's leading whitespace is `leading_spaces` bytes long.
+    (normalized, leading_spaces)
 }
 
 fn apply_full_text_subs<'a>(
@@ -535,6 +1122,7 @@ struct ParserState {
     indent: IndentTracker,
     banner: BannerState,
     normalized: String,
+    texts: SiblingTexts,
 }
 
 impl ParserState {
@@ -544,6 +1132,7 @@ impl ParserState {
             indent: IndentTracker::new(),
             banner: BannerState::new(),
             normalized: String::with_capacity(256),
+            texts: SiblingTexts::new(),
         }
     }
 
@@ -611,7 +1200,7 @@ pub fn parse_into_tree(tree: &mut Tree, config_raw: &str) -> Result<(), TreeErro
     // means one extra reallocation.
     tree.arena.reserve(config_text.len() / 24 + 1);
 
-    for raw_line in splitlines(&config_text) {
+    for (raw_line, normalized_indent) in parse_lines(&config_text) {
         if state.banner.in_banner {
             state.handle_banner_continuation(tree, raw_line)?;
             continue;
@@ -621,18 +1210,26 @@ pub fn parse_into_tree(tree: &mut Tree, config_raw: &str) -> Result<(), TreeErro
             continue;
         }
 
-        let normalized_line = normalize_whitespace(raw_line, &mut state.normalized);
-        let line = per_line_subs.apply(normalized_line);
-        let line_trimmed_right = line.trim_end();
+        let (normalized_line, indent) = match normalized_indent {
+            Some(indent) => (raw_line, indent),
+            None => normalize_whitespace(raw_line, &mut state.normalized),
+        };
+        let line = per_line_subs.apply_indented(normalized_line, Some(indent));
+        let line_trimmed_right = trim_end(&line);
         if line_trimmed_right.is_empty() {
             continue;
         }
 
-        let actual_indent = leading_whitespace_len(line_trimmed_right);
+        // A line no substitution rewrote keeps the indentation measured above.
+        let actual_indent = match line {
+            Cow::Borrowed(_) => indent,
+            Cow::Owned(_) => leading_whitespace_len(line_trimmed_right),
+        };
         let this_indent = i32::try_from(actual_indent).unwrap_or(i32::MAX) + state.indent.adjust;
-        let line_content = line_trimmed_right.trim_start();
-
-        state.cursor.record_line(tree, this_indent, line_content)?;
+        let line_content = &line_trimmed_right[actual_indent..];
+        state
+            .cursor
+            .record_trimmed_line(tree, this_indent, line_content, &mut state.texts)?;
 
         state.indent.update(&indent_rules, line_content)?;
     }
@@ -663,36 +1260,94 @@ pub fn parse_into_tree(tree: &mut Tree, config_raw: &str) -> Result<(), TreeErro
 ///
 /// Returns [`TreeError`] if a line cannot be inserted into the tree.
 pub fn load_fast(tree: &mut Tree, lines: &[&str], run_post_load: bool) -> Result<(), TreeError> {
-    tree.driver
-        .rules
-        .validate_regexes()
-        .map_err(TreeError::InvalidRegex)?;
-    let mut cursor = ParserCursor::new(tree.root);
+    let mut loader = FastLoader::new(tree, lines.len())?;
+    for line in lines {
+        loader.load_line(tree, line, None)?;
+    }
+    finish_fast_load(tree, run_post_load);
+    Ok(())
+}
 
-    let per_line_subs = PreparedSubs::new(&tree.driver.rules.per_line_sub)?;
-    // Reused across lines so the slow path allocates at most once for the whole parse.
-    let mut normalized = String::with_capacity(256);
+/// [`load_fast`] for configuration text not yet split into lines.
+///
+/// The text is split on exactly the [`splitlines`] boundaries, so this is
+/// equivalent to calling [`load_fast`] on the split lines, but walks the text
+/// once instead of collecting the lines first and re-scanning each of them.
+///
+/// # Errors
+///
+/// Returns [`TreeError`] if a line cannot be inserted into the tree.
+pub fn load_fast_text(tree: &mut Tree, text: &str, run_post_load: bool) -> Result<(), TreeError> {
+    // Estimated from the byte length, as in [`parse_into_tree`].
+    let mut loader = FastLoader::new(tree, text.len() / 24 + 1)?;
+    for (line, normalized_indent) in parse_lines(text) {
+        loader.load_line(tree, line, normalized_indent)?;
+    }
+    finish_fast_load(tree, run_post_load);
+    Ok(())
+}
 
-    // Nearly every line becomes a node, so sizing the arena up front avoids the
-    // repeated grow-and-copy of a node table whose entries are hundreds of bytes.
-    tree.arena.reserve(lines.len());
+fn finish_fast_load(tree: &mut Tree, run_post_load: bool) {
+    crate::post_load::delete_sectional_exit_recursive(tree);
+    if run_post_load {
+        crate::post_load::run_post_load_callbacks(tree);
+    }
+}
 
-    for original_line in lines {
+/// Per-parse state shared by [`load_fast`] and [`load_fast_text`].
+struct FastLoader {
+    cursor: ParserCursor,
+    texts: SiblingTexts,
+    per_line_subs: PreparedSubs,
+    /// Reused across lines so the slow path allocates at most once for the whole parse.
+    normalized: String,
+}
+
+impl FastLoader {
+    fn new(tree: &mut Tree, expected_lines: usize) -> Result<Self, TreeError> {
+        tree.driver
+            .rules
+            .validate_regexes()
+            .map_err(TreeError::InvalidRegex)?;
+        let per_line_subs = PreparedSubs::new(&tree.driver.rules.per_line_sub)?;
+        // Nearly every line becomes a node, so sizing the arena up front avoids the
+        // repeated grow-and-copy of a node table whose entries are hundreds of bytes.
+        tree.arena.reserve(expected_lines);
+        Ok(Self {
+            cursor: ParserCursor::new(tree.root),
+            texts: SiblingTexts::new(),
+            per_line_subs,
+            normalized: String::with_capacity(256),
+        })
+    }
+
+    /// Loads one line. `normalized_indent` is the indentation length of a line
+    /// already known to be space-indented and whitespace-normalized, as reported by
+    /// [`parse_lines`]; such a line skips both scans below.
+    fn load_line(
+        &mut self,
+        tree: &mut Tree,
+        original_line: &str,
+        normalized_indent: Option<usize>,
+    ) -> Result<(), TreeError> {
         // One indentation scan per line: it doubles as the blank-line check, and is
         // reused unless a substitution actually rewrote the line.
-        let original_indent = leading_whitespace_len(original_line);
+        let original_indent =
+            normalized_indent.unwrap_or_else(|| leading_whitespace_len(original_line));
         if original_indent == original_line.len() {
-            continue;
+            return Ok(());
         }
 
-        let processed_line = per_line_subs.apply(original_line);
-        let indent_len = match &processed_line {
-            Cow::Borrowed(_) => original_indent,
-            Cow::Owned(rewritten) => leading_whitespace_len(rewritten),
+        let processed_line = self
+            .per_line_subs
+            .apply_indented(original_line, Some(original_indent));
+        let (indent_len, known_normalized) = match &processed_line {
+            Cow::Borrowed(_) => (original_indent, normalized_indent.is_some()),
+            Cow::Owned(rewritten) => (leading_whitespace_len(rewritten), false),
         };
         let processed_trimmed = &processed_line[indent_len..];
         if processed_trimmed.is_empty() {
-            continue;
+            return Ok(());
         }
 
         let indent = i32::try_from(indent_len).unwrap_or(i32::MAX);
@@ -700,28 +1355,24 @@ pub fn load_fast(tree: &mut Tree, lines: &[&str], run_post_load: bool) -> Result
         // Mirrors the full parser: lines that already have single-space separators and
         // no trailing whitespace — nearly all of them — are borrowed as-is instead of
         // being rebuilt word by word.
-        let normalized_line: &str = if is_already_normalized(processed_trimmed.as_bytes()) {
-            processed_trimmed
-        } else {
-            normalized.clear();
-            for word in processed_trimmed.split_whitespace() {
-                if !normalized.is_empty() {
-                    normalized.push(' ');
+        let normalized_line: &str =
+            if known_normalized || is_already_normalized(processed_trimmed.as_bytes()) {
+                processed_trimmed
+            } else {
+                self.normalized.clear();
+                for word in processed_trimmed.split_whitespace() {
+                    if !self.normalized.is_empty() {
+                        self.normalized.push(' ');
+                    }
+                    self.normalized.push_str(word);
                 }
-                normalized.push_str(word);
-            }
-            &normalized
-        };
+                &self.normalized
+            };
 
-        cursor.record_line(tree, indent, normalized_line)?;
+        self.cursor
+            .record_trimmed_line(tree, indent, normalized_line, &mut self.texts)?;
+        Ok(())
     }
-
-    crate::post_load::delete_sectional_exit_recursive(tree);
-    if run_post_load {
-        crate::post_load::run_post_load_callbacks(tree);
-    }
-
-    Ok(())
 }
 
 /// Parses pre-formatted lines into a `Tree`, running stock post-load callbacks (if enabled)
@@ -858,6 +1509,256 @@ pub fn from_dump(driver: Driver, dump: &Dump) -> Result<Tree, TreeError> {
 mod tests {
     use super::*;
 
+    /// Applies `rules` one after another with no prefiltering at all.
+    fn sequential_subs(rules: &[crate::models::PerLineSubRule], line: &str) -> String {
+        let mut text = line.to_owned();
+        for rule in rules {
+            let re = rule_regex(&rule.search).unwrap();
+            let replacement = python_replacement(&re, &rule.replace).unwrap();
+            text = re.replace_all(&text, replacement.as_str()).into_owned();
+        }
+        text
+    }
+
+    fn sub(search: &str, replace: &str) -> crate::models::PerLineSubRule {
+        crate::models::PerLineSubRule {
+            search: search.to_owned(),
+            replace: replace.to_owned(),
+        }
+    }
+
+    const SUB_PROBES: &[&str] = &[
+        "",
+        " ",
+        "!",
+        "! comment",
+        "   ! indented comment",
+        "\u{3000}! ideographic-space comment",
+        "\u{a0}# nbsp comment",
+        "#",
+        "end",
+        "end ",
+        "endx",
+        "end-policy",
+        "end-set",
+        "next",
+        "version 15.2",
+        "Building configuration...",
+        "Current configuration : 1234 bytes",
+        "! Last configuration change at 10:00",
+        "ntp clock-period 17179",
+        " logging event link-status",
+        " logging event link-statusx",
+        "  ipv6 unreachables disable",
+        " no ip address",
+        " no ip address 10.0.0.1",
+        " exit-address-family",
+        "interface GigabitEthernet0/1",
+        " description Link to device — 设备",
+        " speed 1000",
+        " duplex full",
+        "snmp-server location  two spaces",
+        "boot system flash:image.bin",
+        "router(config)# show run",
+        "; procurve comment",
+        "Running configuration:",
+        "ver 08.0.30",
+        "crypto key generate rsa general-keys modulus 2048",
+        "exit",
+        "  exit",
+    ];
+
+    #[test]
+    fn per_line_subs_match_a_sequential_pass_for_every_platform() {
+        for platform in Platform::ALL {
+            let rules = Driver::for_platform(platform).rules.per_line_sub;
+            let prepared = PreparedSubs::new(&rules).unwrap();
+            for line in SUB_PROBES {
+                assert_eq!(
+                    prepared.apply(line),
+                    sequential_subs(&rules, line),
+                    "{platform:?}: {line:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn per_line_subs_rerun_later_rules_on_rewritten_text() {
+        let rules = [
+            sub("^a", "!b"),
+            sub(r"^\s*[#!]x", "unreachable"),
+            sub("^!b", "  #c"),
+            sub(r"^\s*#c$", "done"),
+            sub("c", "C"),
+            sub(r"^\s+done", "late"),
+            sub("^(?i)DONE", "flagged"),
+        ];
+        let prepared = PreparedSubs::new(&rules).unwrap();
+        for line in ["a", "ab", "!b", "  #c", "x", "done", "DONE", "#x"] {
+            assert_eq!(
+                prepared.apply(line),
+                sequential_subs(&rules, line),
+                "{line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn per_line_subs_beyond_the_dispatch_width_still_apply_in_order() {
+        let mut rules: Vec<_> = (0..70).map(|i| sub(&format!("^r{i}$"), "")).collect();
+        rules.push(sub("^r69$", "r70"));
+        rules.push(sub("^z", "r1"));
+        let prepared = PreparedSubs::new(&rules).unwrap();
+        for line in ["r0", "r1", "r69", "r70", "zz", "q"] {
+            assert_eq!(
+                prepared.apply(line),
+                sequential_subs(&rules, line),
+                "{line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn prefix_guards_only_describe_text_every_match_starts_with() {
+        let cases: [(&str, Option<(bool, usize)>); 20] = [
+            ("^end$", Some((false, 3))),
+            (r"^\s*[#!].*", Some((true, 1))),
+            ("^ntp clock-period .*", Some((false, 17))),
+            // A quantified element is optional, so the guard stops before it.
+            ("^ab*c", Some((false, 1))),
+            ("^ab?", Some((false, 1))),
+            ("^ab{0,2}", Some((false, 1))),
+            ("^ab+c", Some((false, 2))),
+            (r"^ver \S+", Some((false, 4))),
+            // Unanchored, alternated, flagged or otherwise opaque patterns are unguarded.
+            (".*speed.*", None),
+            ("!.*", None),
+            ("^a|b", None),
+            ("^(?i)end", None),
+            (r"^\S+#.*", None),
+            ("^[^!]", None),
+            ("^[a-z]", None),
+            ("^[]", None),
+            ("^.x", None),
+            // `\s*` could also consume a leading space the guard would demand.
+            (r"^\s* x", None),
+            (r"^\s*[ x]", None),
+            (r"^\s*$", None),
+        ];
+        for (pattern, expected) in cases {
+            let guard =
+                PrefixGuard::of(pattern).map(|guard| (guard.skip_whitespace, guard.classes.len()));
+            assert_eq!(guard, expected, "{pattern}");
+        }
+    }
+
+    #[test]
+    fn prefix_guards_record_when_they_describe_the_whole_pattern() {
+        let tail = |pattern: &str| PrefixGuard::of(pattern).and_then(|guard| guard.tail);
+        assert_eq!(tail(r"^\s*[#!].*"), Some(GuardTail::RestOfLine));
+        assert_eq!(tail("^version.*$"), Some(GuardTail::RestOfLine));
+        assert_eq!(tail("^end$"), Some(GuardTail::EndOfLine));
+        assert_eq!(tail("^ no ip address"), Some(GuardTail::Open));
+        assert_eq!(tail("^ab+"), None);
+        assert_eq!(tail("^ab*"), None);
+        assert_eq!(tail(r"^ver \S+"), None);
+        assert_eq!(tail("^end.+"), None);
+        assert_eq!(tail("^end.*x"), None);
+    }
+
+    #[test]
+    fn exact_prefix_guards_substitute_like_the_regex() {
+        let rules = [
+            sub(r"^\s*[#!].*", ""),
+            sub("^end$", "fin"),
+            sub(r"^\s*no ip", "ip"),
+            sub("^ab.*", r"\g<0>-copy"),
+            sub("^cost$", "$5"),
+            sub("^tail", "$x"),
+            sub("^line.*", "L"),
+        ];
+        let prepared = PreparedSubs::new(&rules).unwrap();
+        for line in [
+            "!",
+            "  # note",
+            "\u{3000}!x",
+            "end",
+            "end ",
+            "ending",
+            " no ip address",
+            "\u{a0}no ipx",
+            "no i",
+            "abc",
+            "cost",
+            "costs",
+            "tail end",
+            "line\nnext",
+            "line\rx",
+            "",
+        ] {
+            assert_eq!(
+                prepared.apply(line),
+                sequential_subs(&rules, line),
+                "{line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn prefix_guards_skip_unicode_whitespace_like_the_regex() {
+        let guard = PrefixGuard::of(r"^\s*[#!]").unwrap();
+        assert!(guard.admits("\u{3000}\u{a0}\t!"));
+        assert!(guard.admits("#"));
+        assert!(!guard.admits("x!"));
+        assert!(!guard.admits("   "));
+        let literal = PrefixGuard::of("^end").unwrap();
+        assert!(literal.admits("endx"));
+        assert!(!literal.admits("en"));
+        assert!(!literal.admits(" end"));
+        assert!(!literal.admits("énd"));
+    }
+
+    #[test]
+    fn parsed_lines_are_trimmed_of_whitespace_substitutions_introduce() {
+        let mut driver = Driver::default();
+        driver.rules.per_line_sub = vec![
+            crate::models::PerLineSubRule {
+                search: "^tail$".to_owned(),
+                replace: "end\u{a0}\u{2003}".to_owned(),
+            },
+            crate::models::PerLineSubRule {
+                search: "^lead ".to_owned(),
+                replace: "\u{3000}".to_owned(),
+            },
+        ];
+        let mut tree = Tree::new(driver);
+        parse_into_tree(
+            &mut tree,
+            "parent x\u{2003}\nlead child\u{a0}\ntail \nplain\t",
+        )
+        .unwrap();
+        let texts: Vec<_> = tree
+            .all_children_sorted(tree.root)
+            .into_iter()
+            .map(|id| {
+                (
+                    tree.arena[id].text.to_string(),
+                    tree.arena[id].real_indent_level,
+                )
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                ("parent x".to_owned(), 0),
+                ("child".to_owned(), 3),
+                ("end".to_owned(), 0),
+                ("plain".to_owned(), 0)
+            ]
+        );
+    }
+
     #[test]
     fn load_fast_skips_blank_lines_and_indents_after_per_line_subs() {
         let mut driver = Driver::default();
@@ -907,6 +1808,73 @@ mod tests {
     }
 
     #[test]
+    fn normalized_indent_matches_the_rebuilt_line() {
+        for raw in [
+            "  ip address  1.1.1.1",
+            "\t interface x",
+            "  \u{a0}description  café",
+            " \u{2028}a\u{a0} b",
+            "   ",
+            "plain",
+            "  normal line",
+        ] {
+            let mut buffer = String::new();
+            let (line, indent) = normalize_whitespace(raw, &mut buffer);
+            assert_eq!(indent, leading_whitespace_len(line), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn fused_line_scan_matches_splitlines_and_normalization() {
+        const ALPHABET: [&str; 16] = [
+            "a", "b", "c", "d", "e", "f", " ", " ", " ", "\n", "\r", "\t", "\u{e9}", "\u{2028}",
+            "\u{85}", "\x1f",
+        ];
+        let mut state: u32 = 0x2545_f491;
+        for _ in 0..20_000 {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            let len = state as usize % 120;
+            let mut next = state;
+            let text: String = (0..len)
+                .map(|_| {
+                    next ^= next << 13;
+                    next ^= next >> 17;
+                    next ^= next << 5;
+                    ALPHABET[(next % 16) as usize]
+                })
+                .collect();
+            let fused: Vec<(&str, Option<usize>)> = parse_lines(&text).collect();
+            let expected: Vec<&str> = splitlines(&text).collect();
+            assert_eq!(
+                fused.iter().map(|(line, _)| *line).collect::<Vec<_>>(),
+                expected,
+                "{text:?}"
+            );
+            for (line, indent) in fused {
+                if let Some(indent) = indent {
+                    let mut buffer = String::new();
+                    assert_eq!(
+                        normalize_whitespace(line, &mut buffer),
+                        (line, indent),
+                        "{line:?}"
+                    );
+                }
+            }
+        }
+        let clean: Vec<_> =
+            parse_lines(" interface Gi0/1\r\n  ip address 1.1.1.1 255.0.0.0\n").collect();
+        assert_eq!(
+            clean,
+            [
+                (" interface Gi0/1", Some(1)),
+                ("  ip address 1.1.1.1 255.0.0.0", Some(2))
+            ]
+        );
+    }
+
+    #[test]
     fn word_at_a_time_normalization_check_matches_the_byte_scan() {
         const ALPHABET: [u8; 6] = [b'a', b' ', b' ', b'\t', 0x01, 0xc3];
         let mut state: u32 = 0x9e37_79b9;
@@ -929,6 +1897,14 @@ mod tests {
         assert!(!is_already_normalized(b"abcdefg  hijklmnop"));
         assert!(!is_already_normalized(b"abcdefgh "));
         assert!(is_already_normalized(b"abcdefg hijklmno p"));
+        // The tail is re-read as an overlapping word: its pairs, its last byte and
+        // bytes the overlap shares with the previous word must all be judged once.
+        assert!(!is_already_normalized(b"abcdefghij  k"));
+        assert!(!is_already_normalized(b"abcdefgh ijk "));
+        assert!(!is_already_normalized(b"abcdefgh ijk\t"));
+        assert!(!is_already_normalized(b"abcdefgh ij\xc3\xa9"));
+        assert!(is_already_normalized(b"abcdefg hij k"));
+        assert!(is_already_normalized(b"abcdefgh i j k l"));
     }
 
     fn byte_scan_line_boundary(bytes: &[u8]) -> Option<(usize, usize)> {
@@ -1190,6 +2166,174 @@ interface GigabitEthernet0/1
         .unwrap();
         assert!(fast_cb_run.get());
         assert_eq!(fast_tree_cb.len(), 2);
+    }
+
+    #[test]
+    fn load_fast_text_matches_load_fast_over_splitlines() {
+        let configs = [
+            "",
+            "hostname r1",
+            "interface a\n description  two   spaces \n\n   \n\tshutdown\r\n mtu 9000\r\
+             interface b\x0b ip address 10.0.0.1 255.0.0.0\x0c\u{85}\u{2028} vlan 10\u{2029}end",
+            "interface Vlan1\n ip address 1.1.1.1 255.0.0.0\n!\nrouter bgp 1\n  neighbor x\n \
+             exit\n\u{a0}tail line with trailing space \nlast",
+            "interface Ethernet1/1\n switchport trunk allowed vlan 1-20\n description caf\u{e9}",
+        ];
+        for platform in [Platform::Generic, Platform::CiscoIos, Platform::CiscoXr] {
+            for config in configs {
+                for run_post_load in [false, true] {
+                    let lines: Vec<&str> = splitlines(config).collect();
+                    let mut expected = Tree::for_platform(platform);
+                    load_fast(&mut expected, &lines, run_post_load).unwrap();
+                    let mut actual = Tree::for_platform(platform);
+                    load_fast_text(&mut actual, config, run_post_load).unwrap();
+                    assert_eq!(
+                        actual.dump_simple(false),
+                        expected.dump_simple(false),
+                        "{platform:?} {config:?}"
+                    );
+                    assert_eq!(actual.dump(), expected.dump(), "{platform:?} {config:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn load_fast_text_matches_load_fast_after_per_line_subs() {
+        let mut driver = Driver::default();
+        driver.rules.per_line_sub = [
+            ("^drop.*", "   "),
+            ("^NEST ", "  "),
+            ("^ mtu", "   mtu  "),
+            ("shutdown$", "shutdown   "),
+        ]
+        .into_iter()
+        .map(|(search, replace)| crate::models::PerLineSubRule {
+            search: search.to_owned(),
+            replace: replace.to_owned(),
+        })
+        .collect();
+        let config = "interface a\ndrop me\nNEST description x\n mtu 9000\n shutdown\n\
+                      interface b\n\tdescription  tabbed\n shutdown";
+        let lines: Vec<&str> = splitlines(config).collect();
+        let mut expected = Tree::new(driver.clone());
+        load_fast(&mut expected, &lines, false).unwrap();
+        let mut actual = Tree::new(driver);
+        load_fast_text(&mut actual, config, false).unwrap();
+        assert_eq!(actual.dump(), expected.dump());
+        assert_eq!(
+            actual.dump_simple(false),
+            [
+                "interface a",
+                "  description x",
+                "    mtu 9000",
+                "  shutdown",
+                "interface b",
+                "  description tabbed",
+                "  shutdown",
+            ]
+        );
+    }
+
+    #[test]
+    fn load_fast_text_reports_duplicate_children_like_load_fast() {
+        let mut driver = Driver::for_platform(Platform::Generic);
+        driver.rules.parent_allows_duplicate_child.clear();
+        let config = "interface a\n mtu 1\n mtu 1";
+        let lines: Vec<&str> = splitlines(config).collect();
+        let mut expected = Tree::new(driver.clone());
+        let mut actual = Tree::new(driver);
+        assert_eq!(
+            load_fast_text(&mut actual, config, false).is_err(),
+            load_fast(&mut expected, &lines, false).is_err()
+        );
+    }
+
+    #[test]
+    fn repeated_section_lines_share_text_without_changing_the_tree() {
+        let config = "interface a\n no shutdown\n mtu 9000\ninterface b\n no shutdown\n \
+                      mtu 1500\ninterface c\n mtu 1500\n no shutdown\nno shutdown\nno shutdown 2";
+        for fast in [false, true] {
+            let mut tree = Tree::for_platform(Platform::Generic);
+            if fast {
+                let lines: Vec<&str> = config.lines().collect();
+                load_fast(&mut tree, &lines, true).unwrap();
+            } else {
+                parse_into_tree(&mut tree, config).unwrap();
+            }
+            let text = |path: &[&str]| {
+                let id = path.iter().fold(tree.root, |parent, part| {
+                    tree.get_child_by_text(parent, part).unwrap()
+                });
+                Arc::clone(&tree.arena[id].text)
+            };
+            let a = text(&["interface a", "no shutdown"]);
+            let b = text(&["interface b", "no shutdown"]);
+            let c = text(&["interface c", "no shutdown"]);
+            assert!(Arc::ptr_eq(&a, &b));
+            assert!(!Arc::ptr_eq(&b, &c));
+            assert!(!Arc::ptr_eq(
+                &text(&["interface b", "mtu 1500"]),
+                &text(&["interface c", "mtu 1500"])
+            ));
+            assert_eq!(&*c, "no shutdown");
+            assert_eq!(&*text(&["no shutdown"]), "no shutdown");
+            assert!(!Arc::ptr_eq(&text(&["no shutdown"]), &a));
+            assert_eq!(
+                tree.dump_simple(false),
+                [
+                    "interface a",
+                    "  no shutdown",
+                    "  mtu 9000",
+                    "interface b",
+                    "  no shutdown",
+                    "  mtu 1500",
+                    "interface c",
+                    "  mtu 1500",
+                    "  no shutdown",
+                    "no shutdown",
+                    "no shutdown 2",
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn sibling_texts_only_track_leading_positions() {
+        let mut texts = SiblingTexts::new();
+        let late = SiblingTexts::POSITIONS;
+        let first = texts.share(late, "x");
+        assert!(!Arc::ptr_eq(&first, &texts.share(late, "x")));
+        let early = texts.share(0, "x");
+        assert!(Arc::ptr_eq(&early, &texts.share(0, "x")));
+        assert!(!Arc::ptr_eq(&early, &texts.share(1, "x")));
+        assert_eq!(&*texts.share(0, "y"), "y");
+        assert!(!Arc::ptr_eq(&early, &texts.share(0, "x")));
+    }
+
+    #[test]
+    fn parser_rejects_lines_beyond_max_tree_depth() {
+        let limit = crate::tree::MAX_TREE_DEPTH;
+        let config = |depth: usize| -> String {
+            (0..depth).fold(String::new(), |mut config, level| {
+                config.push_str(&" ".repeat(level));
+                config.push_str("level\n");
+                config
+            })
+        };
+        assert!(Tree::from_str(Platform::Generic, &config(limit)).is_ok());
+        assert!(matches!(
+            Tree::from_str(Platform::Generic, &config(limit + 1)),
+            Err(TreeError::MaxDepthExceeded(_))
+        ));
+        let mut tree = Tree::new(Driver::default());
+        let mut cursor = ParserCursor::new(tree.root);
+        cursor.record_line(&mut tree, 0, "a").unwrap();
+        cursor.record_line(&mut tree, 1, "b").unwrap();
+        cursor.record_line(&mut tree, 0, "c").unwrap();
+        cursor.record_line(&mut tree, 1, "d").unwrap();
+        let d = cursor.record_line(&mut tree, 2, "e").unwrap();
+        assert_eq!(tree.depth(d), 3);
     }
 
     #[test]
