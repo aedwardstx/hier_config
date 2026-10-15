@@ -199,13 +199,18 @@ class TestParsingBenchmarks:
 
     @staticmethod
     def test_fast_load_vs_get_hconfig() -> None:
-        """get_hconfig_fast_load should be faster than get_hconfig."""
+        """Fast load should not be slower than get_hconfig on the same input.
+
+        Both calls receive the same ``str`` so the comparison isolates the two
+        native load paths. A tuple or list of lines additionally pays per-line
+        Python-to-Rust string conversion that ``from_text`` never performs, and
+        ``test_fast_load_large_ios_config`` covers that input shape.
+        """
         config_text = _generate_large_ios_config()
-        config_lines = tuple(config_text.splitlines())
 
         time_full, time_fast = _time_pair(
             lambda: HConfig.from_text(Platform.CISCO_IOS, config_text),
-            lambda: HConfig.from_lines(Platform.CISCO_IOS, config_lines),
+            lambda: HConfig.from_lines(Platform.CISCO_IOS, config_text),
         )
         ratio = time_full / time_fast if time_fast > 0 else float("inf")
         print(

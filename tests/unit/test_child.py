@@ -327,7 +327,10 @@ def test_negate(platform_a: Platform) -> None:
 def test_add_shallow_copy_of(platform_a: Platform) -> None:
     base_config = HConfig.from_text(platform_a)
 
-    interface_a = HConfig.from_text(platform_a).add_child("interface Vlan2")
+    # Keep the source root alive: a dropped root is rebuilt on each `.root`
+    # access, so its id() would depend on CPython address reuse.
+    source_config = HConfig.from_text(platform_a)
+    interface_a = source_config.add_child("interface Vlan2")
     interface_a.add_tags(frozenset(("ta", "tb")))
     interface_a.comments.add("ca")
     interface_a.order_weight = 200
@@ -338,7 +341,7 @@ def test_add_shallow_copy_of(platform_a: Platform) -> None:
     assert copied_interface.order_weight == 200
     assert copied_interface.instances == [
         Instance(
-            id=id(interface_a.root),
+            id=id(source_config),
             comments=frozenset(interface_a.comments),
             tags=interface_a.tags,
         ),
