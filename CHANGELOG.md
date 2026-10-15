@@ -313,6 +313,18 @@ v4 design decisions, for the record:
   tags (each node still has its own `instances` list), making it about 74%
   faster. Native `deepcopy` is about 3% slower because index entries are
   larger. See [Performance & Benchmarks](docs/dev/benchmarks.md). (#302)
+- Faster parsing in the Rust core, with no change to the Python API or to
+  parse results. Each line is scanned once for its boundary, indentation and
+  whitespace normalisation; `per_line_sub` rules are screened by their literal
+  prefix, so most lines run no regex, and whole-line deletions such as `!`
+  comments skip the regex entirely; parsed children are inserted with one
+  index lookup; and the Cisco IOS post-load fixes run in one walk that skips
+  the sectional-exit pass when no line can match it. A `str` passed to
+  `HConfig.from_lines()` is now split and loaded in one native pass. Native
+  parsing of the 50k-line IOS benchmark config takes about half as long, and
+  Python `get_hconfig()` on it about 42% less. The Criterion suite now uses
+  `mimalloc` (a dev-dependency only) to match the extension's allocator. See
+  [Performance & Benchmarks](docs/dev/benchmarks.md). (#302)
 - `HConfigChild.comments` is now a live view over the node's comments rather
   than a detached copy. Mutating the returned object — `child.comments.add(…)`
   — now updates the configuration, where previously the change was silently
@@ -528,6 +540,10 @@ the three v3 negation rule models and their `HConfigDriverRules` fields,
   `pytest-benchmark` plugin was not installed. `pytest-benchmark` is now a dev
   dependency, and the suite types its fixture with a local protocol because
   the plugin ships no type information. (#302)
+- `test_add_shallow_copy_of` failed intermittently: it compared against
+  `id()` of a root that had already been dropped, which is rebuilt on each
+  `.root` access and so depended on CPython address reuse. The test now keeps
+  the source root alive. (#302)
 - The release workflow now builds the Linux aarch64 wheel on a native arm64
   runner. Cross-compilation used an image whose toolchain is GCC 4.8.5, which
   cannot compile the bundled mimalloc allocator, so the v4.0.0b4 release
