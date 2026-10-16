@@ -371,7 +371,7 @@ impl<'de> Deserialize<'de> for Index {
 /// only allocated once a child is appended with mapping enabled, so the leaf nodes
 /// that make up most of a parsed tree carry a single null pointer rather than an
 /// empty hash table. Small indexes are a linear list rather than a hash table (see
-/// [`LINEAR_INDEX_MAX`]). Its keys are `Arc<str>` shared with the node itself, so
+/// `LINEAR_INDEX_MAX`). Its keys are `Arc<str>` shared with the node itself, so
 /// indexing a child is a reference-count bump instead of a second copy of every
 /// configuration line.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -537,7 +537,8 @@ impl Children {
     /// Renaming the last child is the common case (remediation negates a line
     /// right after adding it) and is updated in place: no later sibling can
     /// inherit `old_text`, and any earlier holder of `new_text` stays first.
-    /// Other positions fall back to [`Self::rebuild_mapping`].
+    /// Other positions, or indexes not known to cover every child uniquely,
+    /// fall back to [`Self::rebuild_mapping`].
     pub(crate) fn retext(
         &mut self,
         id: NodeId,
@@ -546,7 +547,7 @@ impl Children {
         arena: &Arena<Node>,
     ) {
         match self.mapping.as_deref_mut() {
-            Some(index) if self.data.last() == Some(&id) => {
+            Some(index) if self.data.last() == Some(&id) && index.len() == self.data.len() => {
                 index.remove_if(old_text, id);
                 index.insert_first(new_text, id);
             }

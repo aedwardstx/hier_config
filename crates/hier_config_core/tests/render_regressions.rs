@@ -117,35 +117,34 @@ fn platform_for(name: &str) -> Platform {
 fn corpus_renders_match_per_node_reference() {
     let cases = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/cases");
     let mut checked = 0;
-    for platform_dir in fs::read_dir(cases).unwrap() {
+    for platform_dir in fs::read_dir(&cases).unwrap() {
         let platform_dir = platform_dir.unwrap().path();
         let platform = platform_for(platform_dir.file_name().unwrap().to_str().unwrap());
         for case in fs::read_dir(&platform_dir).unwrap() {
             let case = case.unwrap().path();
-            for file in ["running.conf", "intended.conf"] {
-                let Ok(text) = fs::read_to_string(case.join(file)) else {
-                    continue;
-                };
-                let Ok(tree) = Tree::from_str(platform, &text) else {
-                    continue;
-                };
-                assert_renders_match_reference(&tree, &format!("{}", case.display()));
-                if let Ok(intended) = fs::read_to_string(case.join("intended.conf"))
-                    && let Ok(target) = Tree::from_str(platform, &intended)
-                    && let Ok(delta) = tree.config_to_get_to(&target)
-                {
-                    assert_renders_match_reference(&delta, &format!("{} delta", case.display()));
-                    assert_unified_diff_matches_reference(
-                        &tree,
-                        &target,
-                        &case.display().to_string(),
-                    );
-                }
-                checked += 1;
-            }
+            // Every case must have both files; a missing or unparsable one fails here
+            // rather than being skipped.
+            let parse = |file: &str| {
+                let path = case.join(file);
+                let text = fs::read_to_string(&path)
+                    .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+                Tree::from_str(platform, &text)
+                    .unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+            };
+            let running = parse("running.conf");
+            let intended = parse("intended.conf");
+            let label = case.display().to_string();
+            assert_renders_match_reference(&running, &format!("{label} running"));
+            assert_renders_match_reference(&intended, &format!("{label} intended"));
+            let delta = running
+                .config_to_get_to(&intended)
+                .unwrap_or_else(|error| panic!("{label} delta: {error}"));
+            assert_renders_match_reference(&delta, &format!("{label} delta"));
+            assert_unified_diff_matches_reference(&running, &intended, &label);
+            checked += 1;
         }
     }
-    assert!(checked > 100, "only {checked} corpus trees checked");
+    assert!(checked > 0, "no corpus cases under {}", cases.display());
 }
 
 #[test]

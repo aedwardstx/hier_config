@@ -1,6 +1,7 @@
 use hier_config_core::arena::{Arena, NodeId};
 use hier_config_core::models::{MatchRule, ParentAllowsDuplicateChildRule, UnusedObjectRule};
-use hier_config_core::{Tree, TreeError};
+use hier_config_core::tree::Node;
+use hier_config_core::{Platform, Tree, TreeError};
 use std::collections::BTreeSet;
 
 const fn missing() -> NodeId {
@@ -176,4 +177,37 @@ fn unused_object_rule_without_named_capture_reports_error_instead_of_hiding_obje
         tree.try_unused_objects(),
         Err(TreeError::InvalidRegex(_))
     ));
+}
+
+#[test]
+fn renaming_last_child_rebuilds_an_incomplete_index() {
+    // `Children::append` with `update_mapping = false` leaves a sibling out of the
+    // text index; renaming the last child must not trust that index in place.
+    for indexed_count in [1, 9] {
+        for renamed_text in ["d", "b"] {
+            let mut tree = Tree::from_str(Platform::CiscoIos, "").unwrap();
+            for index in 0..indexed_count {
+                tree.add_child(tree.root, &format!("a{index}"), true, false)
+                    .unwrap();
+            }
+            let unindexed = tree.arena.insert(Node::new("b", Some(tree.root)));
+            tree.arena[tree.root]
+                .children
+                .append(&"b".into(), unindexed, false);
+            let last = tree.add_child(tree.root, "c", true, false).unwrap();
+
+            tree.set_text(last, renamed_text);
+
+            let children = &tree.arena[tree.root].children;
+            assert_eq!(
+                children.get("b"),
+                Some(unindexed),
+                "renamed to {renamed_text}"
+            );
+            assert_eq!(children.get("c"), None, "renamed to {renamed_text}");
+            if renamed_text == "d" {
+                assert_eq!(children.get("d"), Some(last));
+            }
+        }
+    }
 }

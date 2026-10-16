@@ -74,12 +74,35 @@ impl<T> Arena<T> {
         self.len
     }
 
+    /// Number of slots that can be held without reallocating the slot table.
+    #[cfg(test)]
+    pub(crate) const fn capacity(&self) -> usize {
+        self.slots.capacity()
+    }
+
+    /// Releases slot capacity when the table holds more than twice the slots in use.
+    ///
+    /// Parsers reserve from an estimate of the input's line count; this returns the
+    /// excess when the estimate badly overshot, without reallocating a table that
+    /// ordinary doubling growth produced.
+    pub(crate) fn shrink_excess(&mut self) {
+        if self.slots.capacity() / 2 > self.slots.len() {
+            self.slots.shrink_to_fit();
+        }
+    }
+
     /// Returns true if the arena contains no active items.
     pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
 
     /// Returns the `NodeId` the next [`Self::insert`] will hand out.
+    ///
+    /// Callers such as the tree's child insertion record this id in a parent's
+    /// child index *before* inserting the node, so it must stay exactly what
+    /// `insert` returns: no other insert or remove may happen in between, and any
+    /// change to `insert`'s free-list or generation rules must be mirrored here.
+    /// Those callers only check the match with `debug_assert_eq!`.
     pub fn next_id(&self) -> NodeId {
         self.free_head.map_or_else(
             || NodeId {

@@ -818,8 +818,8 @@ fn find_line_boundary(bytes: &[u8]) -> Option<(usize, usize)> {
     const LOW: u64 = u64::from_le_bytes([0x1f; 8]);
     const HIGH: u64 = u64::from_le_bytes([0x80; 8]);
     let mut index = 0;
-    while let Some(word) = bytes.get(index..index + 8) {
-        let word = u64::from_le_bytes(word.try_into().unwrap_or_default());
+    while let Some(word) = bytes.get(index..).and_then(<[u8]>::first_chunk::<8>) {
+        let word = u64::from_le_bytes(*word);
         let candidates = (word.wrapping_sub(LOW) & !word | word) & HIGH;
         if candidates == 0 {
             index += 8;
@@ -952,8 +952,8 @@ fn scan_normalized_line(bytes: &[u8]) -> Option<(usize, Option<usize>)> {
     }
     let mut index = indent;
     let mut prev_space = false;
-    while let Some(word) = bytes.get(index..index + 8) {
-        let word = u64::from_le_bytes(word.try_into().unwrap_or_default());
+    while let Some(word) = bytes.get(index..).and_then(<[u8]>::first_chunk::<8>) {
+        let word = u64::from_le_bytes(*word);
         let not_space = word ^ SPACES;
         let mut spaces = !((not_space & LOW).wrapping_add(LOW) | not_space | LOW);
         // Bytes below 0x20 or above 0x7f: every line boundary, and everything else
@@ -1195,10 +1195,9 @@ pub fn parse_into_tree(tree: &mut Tree, config_raw: &str) -> Result<(), TreeErro
 
     // Most lines become a node, so sizing the arena up front avoids repeatedly
     // reallocating and copying the node table while parsing a large configuration.
-    // Estimated from the byte length (configuration lines average about 25
-    // bytes) because even counting newlines costs a full extra pass; a miss only
-    // means one extra reallocation.
-    tree.arena.reserve(config_text.len() / 24 + 1);
+    // The estimate is bounded by the line count, so a long line or banner cannot
+    // reserve node slots in proportion to its length.
+    tree.arena.reserve(initial_text_capacity(&config_text));
 
     for (raw_line, normalized_indent) in parse_lines(&config_text) {
         if state.banner.in_banner {
@@ -1245,6 +1244,7 @@ pub fn parse_into_tree(tree: &mut Tree, config_raw: &str) -> Result<(), TreeErro
         ));
     }
 
+    tree.arena.shrink_excess();
     Ok(())
 }
 
@@ -1256,13 +1256,22 @@ pub fn parse_into_tree(tree: &mut Tree, config_raw: &str) -> Result<(), TreeErro
 /// Pass `run_post_load = false` when the caller supplies its own post-load
 /// callbacks, as the Python bindings do for drivers that override the stock set.
 ///
+/// `lines` may be any iterable of string-like items, so callers holding borrowed
+/// or reference-counted strings need not collect a `Vec<&str>` first. The arena is
+/// sized from the iterator's lower size bound.
+///
 /// # Errors
 ///
 /// Returns [`TreeError`] if a line cannot be inserted into the tree.
-pub fn load_fast(tree: &mut Tree, lines: &[&str], run_post_load: bool) -> Result<(), TreeError> {
-    let mut loader = FastLoader::new(tree, lines.len())?;
+pub fn load_fast<I>(tree: &mut Tree, lines: I, run_post_load: bool) -> Result<(), TreeError>
+where
+    I: IntoIterator,
+    I::Item: AsRef<str>,
+{
+    let lines = lines.into_iter();
+    let mut loader = FastLoader::new(tree, lines.size_hint().0)?;
     for line in lines {
-        loader.load_line(tree, line, None)?;
+        loader.load_line(tree, line.as_ref(), None)?;
     }
     finish_fast_load(tree, run_post_load);
     Ok(())
@@ -1279,7 +1288,7 @@ pub fn load_fast(tree: &mut Tree, lines: &[&str], run_post_load: bool) -> Result
 /// Returns [`TreeError`] if a line cannot be inserted into the tree.
 pub fn load_fast_text(tree: &mut Tree, text: &str, run_post_load: bool) -> Result<(), TreeError> {
     // Estimated from the byte length, as in [`parse_into_tree`].
-    let mut loader = FastLoader::new(tree, text.len() / 24 + 1)?;
+    let mut loader = FastLoader::new(tree, initial_text_capacity(text))?;
     for (line, normalized_indent) in parse_lines(text) {
         loader.load_line(tree, line, normalized_indent)?;
     }
@@ -1287,7 +1296,20 @@ pub fn load_fast_text(tree: &mut Tree, text: &str, run_post_load: bool) -> Resul
     Ok(())
 }
 
+/// Initial node-arena reservation for parsing `text`.
+///
+/// Configuration lines average about 25 bytes, so the byte length gives a close
+/// estimate without a separate line-counting pass (which measured 4–10% slower on
+/// the parse benchmarks). Text made of a few very long lines overshoots; the
+/// untouched reservation is returned by [`Arena::shrink_excess`] once loading ends.
+///
+/// [`Arena::shrink_excess`]: crate::arena::Arena::shrink_excess
+const fn initial_text_capacity(text: &str) -> usize {
+    text.len() / 24 + 1
+}
+
 fn finish_fast_load(tree: &mut Tree, run_post_load: bool) {
+    tree.arena.shrink_excess();
     crate::post_load::delete_sectional_exit_recursive(tree);
     if run_post_load {
         crate::post_load::run_post_load_callbacks(tree);
@@ -2233,6 +2255,28 @@ interface GigabitEthernet0/1
                 "  shutdown",
             ]
         );
+    }
+
+    #[test]
+    fn long_lines_keep_no_excess_arena_capacity_after_any_loader() {
+        let long = "x".repeat(1_000_000);
+        let text = format!("description {long}\nhostname {long}");
+        let loaders: [fn(&mut Tree, &str); 3] = [
+            |tree, config| parse_into_tree(tree, config).unwrap(),
+            |tree, config| load_fast_text(tree, config, false).unwrap(),
+            |tree, config| load_fast(tree, splitlines(config), false).unwrap(),
+        ];
+        for load in loaders {
+            let mut tree = Tree::for_platform(Platform::Generic);
+            load(&mut tree, &text);
+            // The root plus one node per line.
+            assert_eq!(tree.arena.len(), 3);
+            assert!(
+                tree.arena.capacity() <= 2 * tree.arena.len(),
+                "two long lines kept {} node slots",
+                tree.arena.capacity()
+            );
+        }
     }
 
     #[test]
