@@ -84,6 +84,10 @@ merged.merge([device1, device2, device3])
 reporter = RemediationReporter.from_merged_config(merged)
 ```
 
+Merged copies retain a separate `Instance` record for each source occurrence.
+Even when identical-text source siblings coalesce into one destination node,
+their distinct comments and tags remain in occurrence order in `instances`.
+
 ## Querying changes
 
 ### Count devices affected by a change

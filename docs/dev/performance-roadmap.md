@@ -34,9 +34,9 @@ Re-derive these with `pytest -m benchmark tests/benchmarks/test_perf_regression.
 
 ### Where the time goes
 
-Python calls on the 10k-line IOS benchmark config against the matching native Criterion benchmarks (see [Performance & Benchmarks](benchmarks.md#profiling-the-python-ffi-split) for the method):
+Python calls on the 10k-line IOS benchmark config against corresponding native Criterion benchmarks (see [Performance & Benchmarks](benchmarks.md#profiling-the-python-ffi-split) for the method and operation differences). Subtraction estimates non-core overhead; it does not profile CPython:
 
-| Operation | Python-visible | Rust core | Spent crossing into CPython |
+| Operation | Python-visible | Rust core | Estimated non-core share |
 |---|---:|---:|---:|
 | `dump` | 3.81 ms | 0.14 ms | **96%** |
 | `iteration` (`all_children_sorted`) | 0.30 ms | 0.03 ms | **89%** |
@@ -45,7 +45,7 @@ Python calls on the 10k-line IOS benchmark config against the matching native Cr
 | `remediation` | 0.39 ms | 0.32 ms | 17% |
 | `get_hconfig` (parse) | 0.57 ms | 0.50 ms | 12% |
 
-The two expensive operations are almost entirely CPython-bound. No amount of Rust optimisation moves them — they are limited by how many Python objects must be allocated and how those objects are shaped, both fixed by the public API. Everything else is dominated by core work. Most of the *algorithmic* headroom there has been taken. The remaining costs are a fixed per-call rule sync (most of the boundary share of `remediation`, see item 5), hashing, and compiler settings. `merge` sits with the CPython-bound pair: its remaining cost is one `Instance` record list per copied node. `str` now spends more than half its time building the one Python string; the native render is already a single buffer pass (see [What is not worth attempting](#what-is-not-worth-attempting)).
+`dump`, iteration and `merge` show large estimated non-core shares, consistent with substantial object-construction and binding costs. These differences alone do not establish how much runs inside CPython or rule synchronization, nor exclude further Rust improvements. `str` is not an exact-operation comparison: its binding renders sectional exits and joins a vector of line strings, whereas the native benchmark disables exits and returns that vector without joining. Its 58% remainder therefore cannot be assigned solely to Python string construction. Other remaining costs include rule synchronization (see item 5), hashing and compiler settings.
 
 For calibration, `dump` is already **~2.2x faster than the fastest pure-Python equivalent** (2.103 ms building the same 3223 `DumpLine` objects in a tight Python loop). This is not Rust performance left on the table; it is the cost of the object model.
 
@@ -246,7 +246,7 @@ Switching the `Mapping` alias to `rustc_hash::FxHashMap` as a throwaway experime
 
 `FxHash` itself is ruled out because it is unseeded. **`foldhash`** is the replacement to evaluate. It is seeded per process (and per map), has no dependencies, is what `hashbrown` uses by default, and is documented as "minimally DoS-resistant", which is the property the index needs. Keep the linear tier. It avoids hashing entirely for the common case of a parent with a few children, and bounding it keeps the flood resistance.
 
-**Follow-on, larger:** reuse the stored hash for cross-tree lookups in remediation and `future()`, instead of rehashing the running-side text. That needs both trees' indexes to share one hasher seed, or a hash stored on the node rather than in the index. This is only worth doing if item 3 (shared text storage) is already changing the node layout. Storing the hash made each index entry larger: native `deepcopy_10k` became about 3% (3 µs) slower, so measure `deepcopy` with any further growth of the entry.
+**Follow-on, larger:** reuse the stored hash for cross-tree lookups in remediation and `future()`, instead of rehashing the running-side text. That needs both trees' indexes to share one hasher seed, or a hash stored on the node rather than in the index. This is only worth doing if item 3 (shared text storage) is already changing the node layout. Native `deepcopy_10k` once read about 3% (3 µs) slower after the hash was cached, within shared-machine variation. Measured against the branch base in alternating Criterion runs, it is about 12% faster overall (133 to 118 µs), so there is no net regression; still measure `deepcopy` with any further growth of the entry.
 
 **Measure first:** repeat the experiment with `foldhash` in place of Fx. Adopt it only if it keeps most of the gain above, and add a crafted-collision test to the property suite.
 
@@ -379,7 +379,7 @@ Intern tag strings once per tree and store each node's tags as a small sorted id
 **Cost:** internal only. Tied to the node layout ([item 3](#3-store-node-text-without-a-per-node-allocation)).
 **Status:** not taken.
 
-`Tree::clone` is dominated by allocator calls and `Arc` reference-count increments for each node's text, child vector and index. Caching each index key's hash made entries larger, which cost about 3% natively and nothing visible from Python. Flattening children into the arena, or sharing immutable index tables copy-on-write, would cut the allocations. Both are layout changes that belong with item 3.
+`Tree::clone` is dominated by allocator calls and `Arc` reference-count increments for each node's text, child vector and index. Native clone timings differed by about 3% after caching each index key's hash, within the reported ~5% noise; against the branch base, `deepcopy_10k` is about 12% faster overall. No difference was visible from Python. Flattening children into the arena, or sharing immutable index tables copy-on-write, would cut the allocations. Both are layout changes that belong with item 3.
 
 ---
 
@@ -398,9 +398,9 @@ Intern tag strings once per tree and store each node's tags as a small sorted id
 - **Free-threaded CPython builds.** Wheels are built for `abi3-py311`, and the stable ABI does not cover free-threaded interpreters, so this would need a separate wheel matrix. It would also require auditing the Python driver layer. After item 8 the GIL is held for little beyond object construction, so the gain does not justify that yet.
 - **Zero-copy `&str` spans into the source text.** A mutable tree outlives its source string, and nodes are added, edited and copied after parsing, so a borrowed span cannot represent node text. The owned-buffer version is item 3.
 
-- **Faster `lines()` / `to_lines()` from Python.** Rendering already walks the tree once into reused buffers; native `render/to_lines_10k` is about 0.14 ms. What remains in the Python call is one `str` per line, which the API requires. `str(config)` already returns one buffer.
+- **Faster `lines()` / `to_lines()` from Python.** Rendering already walks the tree once into reused buffers; native `render/to_lines_10k` is about 0.14 ms. Python calls additionally create one `str` per line, which the API requires. `str(config)` returns one Python string, but first builds native line strings and joins them in the binding; it is not a single-buffer renderer. Profile the exact operation before ruling out further native work.
 - **Lazily materialised `Instance` records in Python `merge()`.** Each copied node needs its own `instances` list; nodes with identical comments and tags already share one frozen `Instance`. Creating the lists on first access was considered and rejected: the binding's per-node Python lists are the authoritative store, read directly by instance syncing, `deepcopy` and pickling, so laziness would change when and whether they exist. What is left of `merge()` (~84% boundary share) is that per-node list, garbage-collector tracking and dictionary inserts.
-- **Removing the per-line C-API cost of `from_lines()` on a list or tuple.** Each line costs an item access, a type check and `PyUnicode_AsUTF8AndSize`, about 60 µs for 8,400 lines, so `from_lines()` on a sequence stays about 5% slower than `from_text()` on the joined text. Avoiding it needs direct access to the tuple's item array or the string data, which the stable ABI (`abi3`) does not offer. Callers that already hold the text should pass it as one `str`, which is split natively.
+- **Removing the remaining per-line C-API cost of `from_lines()` on a list or tuple.** Each line still costs an item access, a type check and `PyUnicode_AsUTF8AndSize`. Tuple items are already borrowed without a reference-count round trip, because a tuple cannot change while the GIL is released; list items keep a `PyBackedStr`, because another thread may mutate the list. On the 8,431-line benchmark config, `from_lines()` on a tuple measured 1.06–1.10x the time of `from_text()` on the joined text (median about 1.08x, shared machine), and a list costs more. In Criterion the Rust loader is no slower on pre-split lines (`parse/fast_load_ios_10k`) than on one string (`parse/fast_load_text_ios_10k`), so the gap is this boundary cost. Avoiding the rest needs direct access to the tuple's item array or the string data, which the stable ABI (`abi3`) does not offer. Callers that already hold the text should pass it as one `str`, which is split natively.
 - **Pre-sizing a line copy buffer in `from_lines()`.** A separate length pass to size the buffer made the call slower (0.92 to 1.00 ms on the 10k config); borrowing each line with `PyBackedStr` removed the copy instead.
 
 - **Parser micro-optimisations that were measured and reverted.** Each of these was neutral or slower on `parse/ios_10k` and `parse/ios_50k`, in paired runs of the Criterion suite:
@@ -455,9 +455,10 @@ Several of these suggestions come up repeatedly, so this list records that they 
 - PyO3 0.27, not 0.24.
 - Linear child lookup for up to eight children (`LINEAR_INDEX_MAX`), with a seeded `SipHash` map above that whose keys cache their hash.
 - Remediation, rollback and `difference` create delta sections lazily; rendering and `dump()` walk the tree once; copies share node text.
-- `from_lines()` borrows its input lines and splits a `str` natively. `from_text()` and `get_hconfig()` borrow the Python string instead of copying it, and a `str` passed to the PyO3 loaders goes through `load_fast_text`, which splits, trims and inserts in one pass.
+- `from_lines()` borrows its input lines (tuple items directly, list items through `PyBackedStr`) and splits an exact `str` natively via `load_fast_text`, which splits, trims and inserts in one pass. String subclasses retain Python `splitlines()` dispatch. `from_text()` and `get_hconfig()` copy the input with `config_raw.to_owned()` in `_load_native` before releasing the GIL and calling `parse_into_tree`; they do not use `load_fast_text`.
 - The parser scans each line once with eight-byte (SWAR) steps for the line boundary, indentation and whitespace normalisation, and screens `per_line_sub` rules through literal-prefix byte tables, so most lines run no regex at all. Rules a prefix fully describes (such as stripping `!` comment lines) substitute without a regex.
-- Parsed children are inserted with one index lookup, the hashed index is reserved ahead of growth, and the Cisco IOS post-load fixes run in one fused walk. The sectional-exit pass is skipped when no line could match an exit rule.
+- The text loaders size the node arena from the input's byte length (about 25 bytes per line) rather than a line-counting pass, which measured 4–10% slower on the parse benchmarks. When the estimate overshoots by more than 2x, as with a few very long lines or a large banner, the unused slots are released once loading finishes.
+- Parsed children are inserted with one index lookup, the hashed index is reserved ahead of growth, and the Cisco IOS post-load fixes run in one fused callback walk. Sectional-exit removal is a separate `delete_sectional_exit_recursive` pass over parents; it screens their last children against possible exit texts before resolving lineage rules, rather than skipping the pass globally.
 - The Criterion suite installs `mimalloc` as its global allocator, matching the extension, so native and Python measurements see the same allocator.
 - A bounded regex cache: at most 512 entries per engine (`regex_cache.rs`).
 - `HConfig` objects are freed. `SharedTree.root_handle` is a weak reference, so no reference cycle survives outside CPython's view. A `weakref` to a dropped `HConfig` is cleared after `gc.collect()`.

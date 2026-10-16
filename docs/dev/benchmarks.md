@@ -290,11 +290,11 @@ Python objects, purely because CPython must allocate memory for 8,823 handles!
 
 ### Profiling the Python FFI Split
 
-Comparing each Python call with the matching native Criterion benchmark (see
+Comparing each Python call with a corresponding native Criterion benchmark (see
 [Native Benchmarks with Criterion](#native-benchmarks-with-criterion)) on the
-same 10k-line workloads shows where the time goes:
+10k-line workloads gives an estimate of non-core overhead, not a profile:
 
-| Operation | Python-Visible Wall Clock | Rust Core (Criterion) | Spent Crossing into CPython |
+| Operation | Python-Visible Wall Clock | Rust Core (Criterion) | Estimated Non-Core Share |
 |---|---:|---:|---:|
 | **`dump()`** | 3.81 ms | 0.14 ms | **96%** |
 | **`all_children_sorted()`** | 0.30 ms | 0.03 ms | **89%** |
@@ -303,15 +303,18 @@ same 10k-line workloads shows where the time goes:
 | **`config_to_get_to`** | 0.39 ms | 0.32 ms | 17% |
 | **`get_hconfig`** | 0.57 ms | 0.50 ms | 12% |
 
-`str()` is compared with `render/to_lines_10k`, the same single-buffer render,
-and `get_hconfig` with `parse/ios_10k`. Both the Python extension and the
-Criterion suite use `mimalloc` as their global allocator, so the columns are
-directly comparable.
+`str()` is compared with `render/to_lines_10k`, which calls
+`dump_simple(false)` and returns a `Vec<String>`. These are not identical
+operations: `str(config)` renders with sectional exits enabled, builds line
+strings, and joins them in the binding before creating the Python string.
+`get_hconfig` is compared with `parse/ios_10k`. Both suites use `mimalloc`,
+but sharing an allocator does not make different operations directly comparable.
 
-For `dump()`, iteration and `merge()`, **85% to 96% of the execution time is
-spent inside the CPython runtime** allocating objects, setting dictionary keys,
-and creating tuples. The Rust computation is a small fraction (32 microseconds
-for iteration; 136 microseconds for dump serialization).
+For `dump()`, iteration and `merge()`, the subtraction estimates **85% to 96%
+outside the corresponding core benchmark**. Object allocation, conversion,
+binding bookkeeping and rule synchronization can contribute; these timings
+alone do not isolate time inside CPython. The native operations are a small
+fraction (32 microseconds for iteration; 136 microseconds for dump serialization).
 
 ### Beating the Python Construction Floor in `dump()`
 
@@ -340,9 +343,9 @@ The Rust core has its own benchmark suite,
 operation in the comparison above, plus `fast_load`, rendering (`lines()` and
 `to_lines()`), a remediation where every interface changes, a remediation
 between disjoint configs, flat `future()` additions, and two non-ASCII
-workloads. Its config generators reproduce the
-Python generators in `tests/benchmarks/test_benchmarks.py` byte for byte, so
-both suites time the same work.
+workloads. Its config generators have the same shape as the Python generators
+in `tests/benchmarks/test_benchmarks.py`, but interface counts differ (see the
+Notes below the results table), so the two suites do not time identical inputs.
 
 The suite times the Rust core only. It does not include PyO3 handles, Python
 object construction or interpreter overhead, so its numbers are a lower bound
@@ -381,7 +384,7 @@ under the same load, `parse/ios_50k` measured 2.45–2.49 ms.
 | `parse/ios_1k` | Parse 1,231 IOS lines | 0.086 ms |
 | `parse/ios_10k` | Parse 10,031 IOS lines | 0.517 ms |
 | `parse/ios_50k` | Parse 48,431 IOS lines | 2.533 ms |
-| `parse/xr_10k` | Parse 10,009 IOS-XR lines | 1.521 ms |
+| `parse/xr_10k` | Parse 12,509 IOS-XR lines (1,250 interfaces) | 1.521 ms |
 | `parse/unicode_10k` | Parse the 10k IOS config with non-ASCII text | 0.699 ms |
 | `parse/fast_load_ios_10k` | `fast_load` of the 10k IOS lines | 0.483 ms |
 | `deepcopy_10k` | Clone the 10k tree | 0.123 ms |
@@ -398,16 +401,22 @@ under the same load, `parse/ios_50k` measured 2.45–2.49 ms.
 | `future_1000_interfaces` | 100 of 1,000 interfaces changed | 0.415 ms |
 | `future_flat_additions_4000` | 4,000 new top-level lines | 0.633 ms |
 | `rollback_1000_interfaces` | Remediation, future and rollback | 0.297 ms |
-| `diff/unified_diff_10k` | Unified diff, 1,000 interfaces | 0.132 ms |
-| `diff/unified_diff_unicode_10k` | As above, non-ASCII text | 0.132 ms |
-| `diff/difference_10k` | `difference`, 1,000 interfaces | 0.199 ms |
-| `diff/difference_unicode_10k` | As above, non-ASCII text | 0.198 ms |
+| `diff/unified_diff/10k` | Unified diff, 100 of 1,200 interfaces changed | 0.132 ms |
+| `diff/unified_diff/unicode_10k` | As above, non-ASCII text | 0.132 ms |
+| `diff/difference/10k` | `difference`, 100 of 1,200 interfaces changed | 0.199 ms |
+| `diff/difference/unicode_10k` | As above, non-ASCII text | 0.198 ms |
 
 Notes:
 
+- The native IOS `10k` workloads use 1,200 interfaces (10,031 lines) and
+  `xr_10k` uses 1,250; the Python generators default to 1,000 interfaces
+  (8,431 IOS lines, 10,009 IOS-XR lines), and the Python diff benchmarks use
+  1,000. Cross-suite timings for these workloads are not matched-operation
+  boundary measurements. The figures above are retained measurements, not
+  re-measurements.
 - Native `dump_10k`, `all_children_sorted_10k` and `merge_10k` are a small
-  fraction of the matching Python calls; the rest is Python object
-  construction (see
+  fraction of the corresponding Python calls; the difference estimates
+  non-core overhead rather than isolating Python object construction (see
   [The CPython Allocation Boundary](#the-cpython-allocation-boundary)).
 - The suite installs `mimalloc` as its global allocator (a bench-only
   dev-dependency), matching the Python extension, so allocation-heavy

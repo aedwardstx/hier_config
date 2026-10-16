@@ -53,6 +53,9 @@ config = HConfig.from_lines(Platform.CISCO_IOS, ["hostname router1", "interface 
 ```
 
 It accepts a list of strings, a tuple of strings, or a single string.
+Exact strings are split natively using Python's `str.splitlines()` boundaries;
+string subclasses retain their overridable `splitlines()` method and are not
+coerced through `str()`.
 
 ## Serialization round-trip: `dump()` and `from_dump()`
 

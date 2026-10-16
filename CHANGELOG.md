@@ -246,19 +246,24 @@ v4 design decisions, for the record:
 ### Changed
 
 - `HConfig.from_lines()` (and `get_hconfig_fast_load()`) marshals input with
-  less overhead. A `str` is split natively on the `str.splitlines()`
-  boundaries instead of being split into Python strings first; lists and
-  tuples are no longer copied with `list()`; and line text is borrowed from
-  the Python strings rather than copied, with the GIL still released for the
-  parse. The fast-load loop also scans each line's indentation once. On a
-  10k-line IOS config this cuts `from_lines()` from 0.91 to 0.82 ms for a
-  tuple and from 1.10 to 0.76 ms for a `str`. (#302)
+  less overhead. An exact `str` is split natively on the `str.splitlines()`
+  boundaries instead of being split into Python strings first (a `str`
+  subclass still goes through its own `splitlines()`); lists and tuples are
+  no longer copied with `list()`; and line text is borrowed from the Python
+  strings rather than copied, with the GIL still released for the parse.
+  Tuple items are borrowed without a per-line reference-count round trip.
+  The fast-load loop also scans each line's indentation once. On a 10k-line
+  IOS config this first cut `from_lines()` from 0.91 to 0.82 ms for a tuple
+  and from 1.10 to 0.76 ms for a `str`. With the current parser, `from_lines()`
+  on a tuple of the 8,431-line benchmark config measures 1.06–1.10x the time
+  of `from_text()` on the joined text; the Rust loader alone is no slower on
+  pre-split lines, so the gap is the per-line string extraction. (#302)
 - Line splitting jumps straight to the first candidate byte of each
   eight-byte word instead of re-scanning it byte by byte, cutting
   `splitlines()` time by roughly a third on IOS and XR configurations
   (about 3% of total parse time). It stays pure integer code with no
   new dependencies; portable SIMD (`std::simd`, `fearless_simd`) was
-  evaluated and measured no faster for these per-line scans.
+  evaluated and measured no faster for these per-line scans. (#302)
 - Future/rollback projection skips the source pre-pass when there are no
   replacement-negation rules and matches prefix
   negations without temporary strings. The exact negated-counterpart lookup
@@ -279,7 +284,8 @@ v4 design decisions, for the record:
   against hier-config 3.7.0, adding IOS-XR parse, `future()` and rollback rows
   and documenting the methodology. (#302)
 - The parser sizes its node arena from the input's byte length instead of a
-  second line-splitting pass. Set-command conversion
+  second line-splitting pass, and releases the unused slots when that estimate
+  overshoots, as it does for a few very long lines. Set-command conversion
   borrows ancestor text instead of copying it. (#302)
 - Parsing is about 40% faster (the 50k-line IOS benchmark drops from 8.3 ms to
   4.7 ms). Line splitting, indentation measurement and the whitespace check scan
@@ -296,8 +302,9 @@ v4 design decisions, for the record:
   rather than once per node. (#302)
 - `HConfig.merge()` and `add_deep_copy_of()` copy subtrees from another tree in
   one native pass instead of recursing through Python per node; merging a
-  10k-line IOS config is about 50% faster. Results, comments, tags and the
-  `Instance` records appended to `instances` are unchanged, and `HConfig`
+  10k-line IOS config is about 50% faster (see below for a further gain).
+  Results, comments, tags and the `Instance` records appended to `instances`
+  are unchanged, and `HConfig`
   subclasses that override `add_deep_copy_of` still have it called. Shallow
   copies of branch nodes also skip the recursive tag walk they discarded. (#302)
 - Further Rust performance work with no change to the Python API. Remediation,
@@ -310,20 +317,25 @@ v4 design decisions, for the record:
   benchmark, Python remediation is about 34% faster, `str()` 59%,
   `unified_diff()` 54% and `difference()` 45%. `HConfig.merge()` shares one
   immutable `Instance` record between copied nodes with the same comments and
-  tags (each node still has its own `instances` list), making it about 74%
-  faster. Native `deepcopy` is about 3% slower because index entries are
-  larger. See [Performance & Benchmarks](docs/dev/benchmarks.md). (#302)
-- Faster parsing in the Rust core, with no change to the Python API or to
-  parse results. Each line is scanned once for its boundary, indentation and
-  whitespace normalisation; `per_line_sub` rules are screened by their literal
-  prefix, so most lines run no regex, and whole-line deletions such as `!`
-  comments skip the regex entirely; parsed children are inserted with one
-  index lookup; and the Cisco IOS post-load fixes run in one walk that skips
-  the sectional-exit pass when no line can match it. A `str` passed to
-  `HConfig.from_lines()` is now split and loaded in one native pass. Native
-  parsing of the 50k-line IOS benchmark config takes about half as long, and
-  Python `get_hconfig()` on it about 42% less. The Criterion suite now uses
-  `mimalloc` (a dev-dependency only) to match the extension's allocator. See
+  tags (each node still has its own `instances` list), making it a further
+  about 74% faster than the native copy alone. Native `deepcopy_10k` is about
+  12% faster than before this work (133 to 118 µs in alternating Criterion
+  runs); an earlier ~3% swing after caching index hashes was not a net
+  regression. See
+  [Performance & Benchmarks](docs/dev/benchmarks.md). (#302)
+- A second round of parser work in the Rust core, with no change to the Python
+  API or to parse results. Each line is scanned once for its boundary,
+  indentation and whitespace normalisation; `per_line_sub` rules are screened
+  by their literal prefix, so most lines run no regex, and whole-line
+  deletions such as `!` comments skip the regex entirely; parsed children are
+  inserted with one index lookup; and the Cisco IOS post-load fixes run in one
+  callback walk. A separate sectional-exit pass visits parents and screens
+  their last children before resolving lineage rules. An exact `str` passed to
+  `HConfig.from_lines()` is now split and loaded in one native pass. On the
+  50k-line IOS benchmark config, Criterion `parse/ios_50k` drops from 4.97 ms
+  to 2.53 ms and Python `get_hconfig()` from 4.35 ms to 2.58 ms. The Criterion
+  suite now uses `mimalloc` (a dev-dependency only) to match the extension's
+  allocator. See
   [Performance & Benchmarks](docs/dev/benchmarks.md). (#302)
 - `HConfigChild.comments` is now a live view over the node's comments rather
   than a detached copy. Mutating the returned object — `child.comments.add(…)`
@@ -531,11 +543,6 @@ the three v3 negation rule models and their `HConfigDriverRules` fields,
 
 ### Fixed
 
-- `test_fast_load_vs_get_hconfig` failed intermittently because `from_lines()`
-  ran 1.16–1.18x as long as `from_text()` against a 1.1x bound. After the
-  marshalling change above the ratio is about 1.05, and the test now
-  alternates 30 samples of each call instead of taking the best of three, so
-  noise cannot favour one side. The bound is unchanged. (#302)
 - `tests/benchmarks/test_perf_benchmark.py` errored because its
   `pytest-benchmark` plugin was not installed. `pytest-benchmark` is now a dev
   dependency, and the suite types its fixture with a local protocol because
