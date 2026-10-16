@@ -474,8 +474,23 @@ impl PyHConfig {
         let base: &PyHConfigBase = slf.as_ref();
         let shared = Arc::clone(&base.tree);
 
-        // `PyBackedStr` keeps each Python string alive and borrows its UTF-8 data, so
-        // the parse can run without the GIL and without copying the text out first.
+        // A tuple cannot be mutated, so while `lines` is alive its items, and the UTF-8
+        // data each one caches, stay valid without the GIL. Borrowing them skips the
+        // per-line reference-count round trip that `PyBackedStr` costs.
+        if let Ok(tuple) = lines.cast::<PyTuple>() {
+            let borrowed = tuple
+                .iter_borrowed()
+                .map(Borrowed::extract::<&str>)
+                .collect::<PyResult<Vec<&str>>>()?;
+            return py.detach(move || {
+                let mut tree = shared.tree.write_py()?;
+                hier_config_core::parser::load_fast(&mut tree, borrowed, run_post_load)
+                    .map_err(to_py_err)
+            });
+        }
+
+        // Any other iterable, such as a list, may change while the GIL is released,
+        // so `PyBackedStr` keeps each line alive and borrows its UTF-8 data instead.
         let (backed, split_text) = if let Ok(text) = lines.cast::<PyString>() {
             // A single string is split Rust-side, avoiding any per-line marshalling.
             (vec![PyBackedStr::try_from(text.clone())?], true)
@@ -485,15 +500,10 @@ impl PyHConfig {
                 backed.push(PyBackedStr::try_from(line.cast_into::<PyString>()?)?);
                 Ok(())
             };
-            // A list or tuple is by far the common case and can be walked by index,
-            // which skips constructing a Python iterator and calling `__next__` once
-            // per line.
+            // A list is by far the common case and can be walked by index, which
+            // skips constructing a Python iterator and calling `__next__` once per line.
             if let Ok(list) = lines.cast::<PyList>() {
                 for line in list {
-                    push(line)?;
-                }
-            } else if let Ok(tuple) = lines.cast::<PyTuple>() {
-                for line in tuple {
                     push(line)?;
                 }
             } else {
@@ -510,8 +520,7 @@ impl PyHConfig {
                     // Walks the text once, without collecting the lines first.
                     hier_config_core::parser::load_fast_text(&mut tree, &backed[0], run_post_load)
                 } else {
-                    let borrowed: Vec<&str> = backed.iter().map(|line| &**line).collect();
-                    hier_config_core::parser::load_fast(&mut tree, &borrowed, run_post_load)
+                    hier_config_core::parser::load_fast(&mut tree, &backed, run_post_load)
                 }
                 .map_err(to_py_err)
             });

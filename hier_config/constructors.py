@@ -204,6 +204,22 @@ def hconfig_from_dump(
     return config
 
 
+def _native_lines(
+    lines: list[str] | tuple[str, ...] | str,
+) -> list[str] | tuple[str, ...] | str:
+    """Return `lines` in a form the native loader may walk directly.
+
+    Exact types only: a `str` subclass may override `splitlines()` and a
+    list/tuple subclass may override iteration, both of which the native
+    loader would bypass.
+    """
+    if type(lines) in {str, list, tuple}:
+        return lines
+    if isinstance(lines, str):
+        return lines.splitlines()
+    return list(lines)
+
+
 def hconfig_from_lines(
     platform_or_driver: Platform | str | HConfigDriverBase,
     lines: list[str] | tuple[str, ...] | str,
@@ -219,14 +235,8 @@ def hconfig_from_lines(
     core_ran = _core_runs_post_load(driver)
     if isinstance(lines, str):
         _reject_structured_format(lines)
-        # The native loader splits on exactly the `str.splitlines()` boundaries.
-        lines = str(lines)
-    elif type(lines) not in {list, tuple}:
-        # Exact types only: a subclass may override iteration, which the native
-        # loader's indexed walk would bypass.
-        lines = list(lines)
 
-    config._load_fast_native(lines, core_ran)  # ruff: ignore[private-member-access]
+    config._load_fast_native(_native_lines(lines), core_ran)  # ruff: ignore[private-member-access]
 
     _run_post_load_callbacks(config, driver, core_ran=core_ran)
 

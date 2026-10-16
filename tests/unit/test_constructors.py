@@ -492,6 +492,36 @@ def test_from_lines_accepts_every_sequence_and_iterable_form() -> None:
         assert HConfig.from_lines(Platform.CISCO_IOS, form).dump_simple() == expected
 
 
+def test_from_lines_str_subclass_honours_splitlines_override() -> None:
+    """A str subclass is split by its own ``splitlines()``, not natively."""
+
+    class _CustomLines(str):  # ruff: ignore[subclass-builtin] - the subclass is the input under test
+        __slots__ = ()
+
+        # Match the standard str.splitlines override signature.
+        def splitlines(self, keepends: bool = False) -> list[str]:  # ruff: ignore[boolean-type-hint-positional-argument, boolean-default-value-positional-argument]
+            ending = "\n" if keepends else ""
+            return [f"{self.partition(' ')[0]} overridden{ending}"]
+
+    config = HConfig.from_lines(Platform.CISCO_IOS, _CustomLines("hostname original"))
+
+    assert config.to_lines() == ("hostname overridden",)
+
+
+def test_from_lines_str_subclass_is_not_converted_with_str() -> None:
+    """A str subclass's ``__str__()`` override does not replace its text."""
+
+    class _CustomString(str):  # ruff: ignore[subclass-builtin] - the subclass is the input under test
+        __slots__ = ()
+
+        def __str__(self) -> str:
+            return "hostname converted"
+
+    config = HConfig.from_lines(Platform.CISCO_IOS, _CustomString("hostname original"))
+
+    assert config.to_lines() == ("hostname original",)
+
+
 def test_from_lines_honours_list_subclass_iteration() -> None:
     """A list subclass overriding ``__iter__`` is iterated, not indexed."""
 
@@ -516,4 +546,12 @@ def test_from_lines_rejects_non_str_items() -> None:
     # Deliberately mistyped input, as an untyped caller could pass.
     lines = cast("list[str]", ["hostname r1", 3])
     with pytest.raises(TypeError):
+        HConfig.from_lines(Platform.CISCO_IOS, lines)
+
+
+def test_from_lines_rejects_non_str_tuple_items() -> None:
+    """Tuple items, which are borrowed rather than copied, must also be str."""
+    # Deliberately mistyped input, as an untyped caller could pass.
+    lines = cast("tuple[str, ...]", ("hostname r1", 3))
+    with pytest.raises(TypeError, match="'int' object cannot be cast as 'str'"):
         HConfig.from_lines(Platform.CISCO_IOS, lines)

@@ -205,3 +205,26 @@ def test_merge_gives_every_node_its_own_instance_list() -> None:
 
     lists[0].append(Instance(id=1, comments=frozenset(), tags=frozenset()))
     assert all(len(items) == 1 for items in lists[1:])
+
+
+def test_merged_duplicate_siblings_keep_per_occurrence_instances() -> None:
+    """Coalesced duplicate siblings keep one `Instance` per source occurrence."""
+    source = HConfig.from_lines(Platform.CISCO_IOS, ())
+    parent = source.add_child("interface Ethernet1")
+    for label in ("first", "second"):
+        child = parent.add_child("description duplicate", check_if_present=False)
+        child.comments.add(label)
+        child.tags_add(label)
+    target = HConfig.from_lines(Platform.CISCO_IOS, ())
+
+    copied = target.add_deep_copy_of(parent, merged=True)
+
+    assert len(copied.children) == 1
+    assert copied.children[0].instances == [
+        Instance(
+            id=id(source),
+            comments=frozenset({label}),
+            tags=frozenset({label}),
+        )
+        for label in ("first", "second")
+    ]

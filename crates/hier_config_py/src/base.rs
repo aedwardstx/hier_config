@@ -157,13 +157,25 @@ impl PyHConfigBase {
                     }
                 },
             );
-            let records: Vec<(NodeId, Instance)> = copied
-                .iter()
-                .filter_map(|&id| {
-                    let instance = tree.arena.get(id)?.instances().last()?;
+            // Several source occurrences can coalesce into one destination.
+            // Match each callback to its own appended instance, from the end,
+            // without confusing it with existing or later instance records.
+            let mut offsets: HashMap<NodeId, usize> = HashMap::new();
+            let mut records: Vec<(NodeId, Instance)> = copied
+                .into_iter()
+                .rev()
+                .filter_map(|id| {
+                    let offset = offsets.entry(id).or_default();
+                    *offset += 1;
+                    let instances = tree.arena.get(id)?.instances();
+                    // Each callback appended one instance to `id`, so `offset` never
+                    // exceeds the count; checked access keeps a broken invariant from
+                    // panicking across the FFI boundary.
+                    let instance = instances.get(instances.len().checked_sub(*offset)?)?;
                     Some((id, instance.clone()))
                 })
                 .collect();
+            records.reverse();
             (result, records)
         };
         if !records.is_empty() {
@@ -191,9 +203,14 @@ impl PyHConfigBase {
                 };
                 appends.push((*node_id, record));
             }
-            let _tree = self.read_tree()?;
+            // Building the records ran Python code (validation, or a finalizer during
+            // garbage collection) that may have deleted a copied node in the meantime.
+            let tree = self.read_tree()?;
             let mut data_map = self.tree.node_data.write_py()?;
             for (node_id, record) in appends {
+                if !tree.arena.contains(node_id) {
+                    continue;
+                }
                 data_map
                     .entry(node_id)
                     .or_default()
