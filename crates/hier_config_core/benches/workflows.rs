@@ -1,10 +1,11 @@
 //! Criterion benchmarks for the native workflows in `docs/dev/benchmarks.md`.
 //!
-//! The configs mirror `_generate_large_ios_config` / `_generate_large_xr_config`
-//! in `tests/benchmarks/test_benchmarks.py` (120, 1200 and 6000 IOS interfaces
-//! give ~1k, ~10k and ~50k lines), so native and Python numbers describe the
-//! same work. These time the Rust core only; Python handle, conversion and
-//! interpreter costs are measured by the Python benchmarks.
+//! The configs have the same generator shape as `_generate_large_ios_config` /
+//! `_generate_large_xr_config` in `tests/benchmarks/test_benchmarks.py`, but the
+//! interface counts differ (120, 1200 and 6000 IOS interfaces give ~1k, ~10k and
+//! ~50k lines here; see the Notes in `docs/dev/benchmarks.md`). These time the
+//! Rust core only; Python handle, conversion and interpreter costs are measured
+//! by the Python benchmarks.
 //!
 //! ```text
 //! cargo bench -p hier_config_core --bench workflows -- --save-baseline before
@@ -17,6 +18,11 @@ use std::time::Duration;
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use hier_config_core::{Platform, Tree, WorkflowRemediation, load_fast};
+
+// Matches the Python extension's allocator, so native and Python timings see
+// the same allocation costs.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 const IOS: Platform = Platform::CiscoIos;
 const OSPF_COST: &str = " ip ospf cost 100";
@@ -133,6 +139,15 @@ fn bench_parse(c: &mut Criterion) {
         b.iter(|| {
             let mut tree = Tree::for_platform(IOS);
             load_fast(&mut tree, black_box(&lines), true).expect("loads");
+            tree
+        });
+    });
+    // `HConfig.from_lines` given one string: split in Rust, same loader as above.
+    group.bench_function("fast_load_text_ios_10k", |b| {
+        b.iter(|| {
+            let mut tree = Tree::for_platform(IOS);
+            hier_config_core::parser::load_fast_text(&mut tree, black_box(&text), true)
+                .expect("loads");
             tree
         });
     });
@@ -260,5 +275,3 @@ criterion_group! {
     targets = bench_parse, bench_tree, bench_remediation, bench_diff
 }
 criterion_main!(benches);
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;

@@ -27,12 +27,11 @@ _T = TypeVar("_T")
 class Benchmark(Protocol):
     """The parts of the untyped pytest-benchmark `benchmark` fixture used here."""
 
-    def __call__(self, function: Callable[..., _T], /, *args: object) -> _T: ...
+    def __call__(self, function: Callable[[], _T], /) -> _T: ...
 
     def pedantic(
         self,
-        target: Callable[..., _T],
-        args: tuple[object, ...],
+        target: Callable[[], _T],
         rounds: int,
         iterations: int,
     ) -> _T: ...
@@ -57,19 +56,18 @@ def ios_config_50k() -> str:
 
 
 def test_benchmark_parse_ios_1k(benchmark: Benchmark, ios_config_1k: str) -> None:
-    result = benchmark(get_hconfig, Platform.CISCO_IOS, ios_config_1k)
+    result = benchmark(lambda: get_hconfig(Platform.CISCO_IOS, ios_config_1k))
     assert len(result) > 0
 
 
 def test_benchmark_parse_ios_10k(benchmark: Benchmark, ios_config_10k: str) -> None:
-    result = benchmark(get_hconfig, Platform.CISCO_IOS, ios_config_10k)
+    result = benchmark(lambda: get_hconfig(Platform.CISCO_IOS, ios_config_10k))
     assert len(result) > 0
 
 
 def test_benchmark_parse_ios_50k(benchmark: Benchmark, ios_config_50k: str) -> None:
     result = benchmark.pedantic(
-        get_hconfig,
-        args=(Platform.CISCO_IOS, ios_config_50k),
+        lambda: get_hconfig(Platform.CISCO_IOS, ios_config_50k),
         rounds=5,
         iterations=1,
     )
@@ -83,7 +81,7 @@ def test_benchmark_remediation_10k(benchmark: Benchmark, ios_config_10k: str) ->
     )
     generated = get_hconfig(Platform.CISCO_IOS, generated_text)
 
-    remediation = benchmark(running.config_to_get_to, generated)
+    remediation = benchmark(lambda: running.config_to_get_to(generated))
     assert len(remediation) > 0
 
 
@@ -95,8 +93,7 @@ def test_benchmark_remediation_50k(benchmark: Benchmark, ios_config_50k: str) ->
     generated = get_hconfig(Platform.CISCO_IOS, generated_text)
 
     remediation = benchmark.pedantic(
-        running.config_to_get_to,
-        args=(generated,),
+        lambda: running.config_to_get_to(generated),
         rounds=5,
         iterations=1,
     )

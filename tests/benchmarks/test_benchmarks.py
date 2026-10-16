@@ -199,13 +199,22 @@ class TestParsingBenchmarks:
 
     @staticmethod
     def test_fast_load_vs_get_hconfig() -> None:
-        """Fast load should not be slower than get_hconfig on the same input.
+        """Sequence fast load should not be meaningfully slower than full-text."""
+        config_text = _generate_large_ios_config()
+        config_lines = tuple(config_text.splitlines())
+        time_full, time_fast = _time_pair(
+            lambda: HConfig.from_text(Platform.CISCO_IOS, config_text),
+            lambda: HConfig.from_lines(Platform.CISCO_IOS, config_lines),
+        )
+        # A tuple pays one C-API string extraction per line that a single str
+        # avoids; this measures 1.06-1.10x, so 1.1x has no room for timer noise.
+        assert time_fast <= time_full * 1.2, (
+            "sequence fast_load should not be meaningfully slower than get_hconfig"
+        )
 
-        Both calls receive the same ``str`` so the comparison isolates the two
-        native load paths. A tuple or list of lines additionally pays per-line
-        Python-to-Rust string conversion that ``from_text`` never performs, and
-        ``test_fast_load_large_ios_config`` covers that input shape.
-        """
+    @staticmethod
+    def test_string_fast_load_vs_get_hconfig() -> None:
+        """Compare the native fast and full-text paths with string input."""
         config_text = _generate_large_ios_config()
 
         time_full, time_fast = _time_pair(
@@ -218,7 +227,7 @@ class TestParsingBenchmarks:
             f"fast_load: {time_fast:.4f}s, "
             f"ratio: {ratio:.1f}x"
         )
-        # fast_load should not be significantly slower (allow 10% variance for CI noise)
+        # fast_load should not be significantly slower (allow 10% for local timing noise)
         assert time_fast <= time_full * 1.1, (
             "fast_load should not be slower than get_hconfig"
         )
