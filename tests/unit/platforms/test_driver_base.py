@@ -1,3 +1,7 @@
+from unittest.mock import patch
+
+import pytest
+
 from hier_config import HConfig, get_hconfig_driver
 from hier_config.child import HConfigChild
 from hier_config.models import Platform
@@ -6,6 +10,11 @@ from hier_config.platforms.aruba_aoscx.driver import HConfigDriverArubaAOSCX
 from hier_config.platforms.cisco_ios.driver import HConfigDriverCiscoIOS
 from hier_config.platforms.cisco_nxos.driver import HConfigDriverCiscoNXOS
 from hier_config.platforms.cisco_xr.driver import HConfigDriverCiscoIOSXR
+from hier_config.platforms.driver_base import (
+    HConfigDriverBase,
+    clear_rules_cache,
+    load_platform_rules,
+)
 from hier_config.platforms.generic.driver import HConfigDriverGeneric
 from hier_config.platforms.hp_comware5.driver import HConfigDriverHPComware5
 from hier_config.platforms.hp_procurve.driver import HConfigDriverHPProcurve
@@ -44,3 +53,36 @@ def test_negation_swapping_is_owned_by_the_core() -> None:
 
     child2 = HConfigChild(config, "no interface GigabitEthernet0/1")
     assert child2.negate().text == "interface GigabitEthernet0/1"
+
+
+def test_driver_base_requires_subclasses_to_supply_rules() -> None:
+    """The base driver has no rules of its own, so constructing it fails clearly."""
+    with pytest.raises(NotImplementedError, match="must implement _instantiate_rules"):
+        HConfigDriverBase()
+
+
+def test_driver_base_config_preprocessor_returns_text_unchanged() -> None:
+    """The default preprocessor is the identity, including for Unicode text."""
+    config_text = "hostname r\u00e9seau\n description caf\u00e9 \u2014 \U0001f600\n"
+
+    assert HConfigDriverBase.config_preprocessor(config_text) == config_text
+
+
+def test_load_platform_rules_falls_back_to_disk_for_unknown_native_platform() -> None:
+    """A platform the extension rejects is read from the checked-in rules file."""
+    native_rules = load_platform_rules(Platform.CISCO_IOS)
+
+    def reject(platform_name: str) -> str:
+        message = f"unknown platform {platform_name!r}"
+        raise ValueError(message)
+
+    clear_rules_cache()
+    with patch("hier_config.platforms.driver_base.get_platform_rules_json", reject):
+        try:
+            disk_rules = load_platform_rules(Platform.CISCO_IOS)
+        finally:
+            clear_rules_cache()
+
+    assert disk_rules.model_dump(exclude={"post_load_callbacks"}) == (
+        native_rules.model_dump(exclude={"post_load_callbacks"})
+    )

@@ -5,6 +5,7 @@ import importlib
 import inspect
 import pickle  # ruff: ignore[suspicious-pickle-import] # Trusted legacy class-reference fixture only.
 from pathlib import Path
+from typing import TypeVar
 
 import pytest
 
@@ -105,3 +106,21 @@ def test_historical_native_module_pickle_resolves_public_type() -> None:
     legacy = b"c_hier_config_rust\nHConfig\n."
     restored = pickle.loads(legacy)  # ruff: ignore[suspicious-pickle-usage] # Trusted literal, not external data.
     assert restored is hier_config.HConfig
+
+
+def test_native_stub_generic_annotations_resolve_to_shared_type_vars() -> None:
+    """Every ``hier_config._typing`` name the stub references is a real TypeVar."""
+    typing_module = importlib.import_module("hier_config._typing")
+    path = Path(hier_config.__file__).parent / "_hier_config_rust.pyi"
+    referenced = {
+        node.attr
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+        if isinstance(node, ast.Attribute)
+        and ast.unparse(node.value) == "hier_config._typing"
+    }
+
+    assert referenced == {"DefaultT", "ValueT"}
+    for name in referenced:
+        type_var = getattr(typing_module, name)
+        assert isinstance(type_var, TypeVar)
+        assert type_var.__name__ == name

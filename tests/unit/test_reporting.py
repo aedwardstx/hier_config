@@ -693,3 +693,71 @@ def test_reporter_with_empty_remediation() -> None:
     assert reporter.device_count == 1
     summary = reporter.summary()
     assert summary.total_unique_changes == 0
+
+
+def _tagged_ntp_snmp_reporter() -> RemediationReporter:
+    """Two devices sharing NTP changes, one with an extra SNMP change, tagged."""
+
+    def remediation(running: str, generated: str) -> HConfig:
+        return WorkflowRemediation(
+            HConfig.from_text(Platform.CISCO_IOS, running),
+            HConfig.from_text(Platform.CISCO_IOS, generated),
+        ).remediation_config
+
+    reporter = RemediationReporter.from_remediations(
+        [
+            remediation(
+                "ntp server 10.1.1.1",
+                "ntp server 10.2.2.2\nsnmp-server community public RO",
+            ),
+            remediation("ntp server 10.1.1.1", "ntp server 10.2.2.2"),
+        ]
+    )
+    reporter.apply_tag_rules(
+        [
+            TagRule(
+                match_rules=(MatchRule(startswith="snmp"),),
+                apply_tags=frozenset({"snmp"}),
+            ),
+            TagRule(
+                match_rules=(MatchRule(contains="ntp"),),
+                apply_tags=frozenset({"ntp"}),
+            ),
+        ]
+    )
+    return reporter
+
+
+def test_summary_counts_changes_by_tag() -> None:
+    """The summary counts unique tagged changes per tag."""
+    summary = _tagged_ntp_snmp_reporter().summary()
+
+    assert summary.changes_by_tag == {"ntp": 2, "snmp": 1}
+
+
+def test_summary_text_lists_tags_by_descending_count() -> None:
+    """The text summary ends with a tag section ordered by change count."""
+    summary_text = _tagged_ntp_snmp_reporter().summary_text()
+
+    assert summary_text.endswith(
+        f"\n\nChanges by Tag:\n{'-' * 50}\n  ntp: 2 changes\n  snmp: 1 changes"
+    )
+
+
+def test_to_markdown_includes_tag_table(tmp_path: Path) -> None:
+    """The Markdown export ends with a tag table ordered by change count."""
+    output_path = tmp_path / "report.md"
+
+    _tagged_ntp_snmp_reporter().to_markdown(output_path)
+
+    assert output_path.read_text(encoding="utf-8").endswith(
+        "## Changes by Tag\n\n| Tag | Count |\n|-----|-------|\n"
+        "| ntp | 2 |\n| snmp | 1 |"
+    )
+
+
+def test_get_impact_distribution_buckets_counts_above_last_bin() -> None:
+    """Changes reaching the final bin boundary fall into the open-ended bucket."""
+    distribution = _tagged_ntp_snmp_reporter().get_impact_distribution(bins=(1, 2))
+
+    assert distribution == {"2+": 2, "1-2": 1}

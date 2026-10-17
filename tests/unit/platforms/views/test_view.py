@@ -261,3 +261,14 @@ def test_bundle_membership_prefix_is_platform_data() -> None:
     assert view.is_bundle
     assert view.bundle_id is None
     assert not tuple(view.bundle_member_interfaces)
+
+
+def test_interface_marker_rejects_objects_that_are_not_interface_views() -> None:
+    """Marker isinstance checks only match native interface views."""
+    config = HConfig.from_text(Platform.CISCO_IOS, "interface Vlan2\n description x")
+    interface = config.get_child(equals="interface Vlan2")
+
+    assert interface is not None
+    assert not isinstance(interface, InterfaceVlanViewMixin)
+    assert not isinstance(config, InterfaceVlanViewMixin)
+    assert not isinstance("interface Vlan2", InterfaceVlanViewMixin)

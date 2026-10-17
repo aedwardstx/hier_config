@@ -1,3 +1,5 @@
+import pytest
+
 from hier_config import HConfig
 from hier_config.models import Platform
 from hier_config.platforms.hp_procurve.driver import (
@@ -6,6 +8,7 @@ from hier_config.platforms.hp_procurve.driver import (
     fixup_hp_procurve_device_profile,
     fixup_hp_procurve_vlan,
 )
+from hier_config.platforms.hp_procurve.functions import hp_procurve_expand_range
 
 
 def test_fixup_aaa_port_access_ranges() -> None:
@@ -111,3 +114,16 @@ def test_default_post_load_callbacks_are_public() -> None:
     assert fixup_hp_procurve_aaa_port_access in callbacks
     assert fixup_hp_procurve_device_profile in callbacks
     assert fixup_hp_procurve_vlan in callbacks
+
+
+def test_hp_procurve_expand_range_rejects_duplicate_interfaces() -> None:
+    """A spec naming the same interface twice is rejected rather than collapsed."""
+    with pytest.raises(ValueError, match=r"frozenset\(interfaces\)"):
+        hp_procurve_expand_range("1/1,1/1")
+
+
+def test_hp_procurve_expand_range_rejects_mismatched_slot_letters() -> None:
+    """A lettered start port requires the same letter on the end port."""
+    assert hp_procurve_expand_range("5/A1-5/A3") == ("5/A1", "5/A2", "5/A3")
+    with pytest.raises(ValueError, match="should start with the same letter"):
+        hp_procurve_expand_range("5/A1-5/3")

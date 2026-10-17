@@ -441,6 +441,36 @@ def test_curly_brace_config_file_path_still_parses(tmp_path: Path) -> None:
     assert config.get_child(equals="set system host-name r1") is not None
 
 
+def test_missing_config_file_path_raises_file_not_found(tmp_path: Path) -> None:
+    """The structured guard defers a missing file to the native loader's error."""
+    with pytest.raises(FileNotFoundError, match="No such file"):
+        HConfig.from_text(Platform.CISCO_IOS, tmp_path / "absent.conf")
+
+
+def test_non_utf8_config_file_path_raises_native_os_error(tmp_path: Path) -> None:
+    """A non-UTF-8 file surfaces the native loader's error, not UnicodeDecodeError."""
+    config_path = tmp_path / "latin1.conf"
+    config_path.write_bytes(b"\xff\xfehostname r1\n")
+    with pytest.raises(OSError, match="valid UTF-8") as excinfo:
+        HConfig.from_text(Platform.CISCO_IOS, config_path)
+    assert excinfo.type is OSError
+
+
+def test_bracket_prefixed_non_json_file_path_matches_text_load(
+    tmp_path: Path,
+) -> None:
+    """A `[`-prefixed file that is not JSON loads exactly like the same string."""
+    config_text = "[edit]\nset system host-name r1\n"
+    config_path = tmp_path / "config.set"
+    config_path.write_text(config_text, encoding="utf-8")
+
+    from_path = HConfig.from_text(Platform.JUNIPER_JUNOS, config_path)
+    from_string = HConfig.from_text(Platform.JUNIPER_JUNOS, config_text)
+
+    assert from_path.to_lines() == from_string.to_lines()
+    assert from_path.get_child(equals="set system host-name r1") is not None
+
+
 def test_dump_round_trip_is_idempotent_for_collapsed_vlan_list() -> None:
     """A dump holds the post-callback tree, so reloading must not re-run them (#302).
 

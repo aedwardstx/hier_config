@@ -6,11 +6,19 @@ work is normally done inside the Rust core, so they are exercised directly
 here.
 """
 
+import importlib
+import sys
+from ipaddress import IPv4Interface
+
 import pytest
 
 from hier_config import Platform, get_hconfig
 from hier_config.platforms import functions
-from hier_config.platforms.functions import convert_to_set_commands, expand_range
+from hier_config.platforms.functions import (
+    convert_to_set_commands,
+    expand_range,
+    parse_ipv4_interface,
+)
 from hier_config.platforms.utils import split_vlan_id_lists
 
 
@@ -110,3 +118,54 @@ def test_convert_to_set_commands_fallback_skips_blank_lines(
     assert convert_to_set_commands("\n\nsystem {\n\n    host-name r1;\n}\n") == (
         "set system host-name r1"
     )
+
+
+@pytest.mark.parametrize(
+    ("words", "expected"),
+    (
+        (["10.0.0.1/24"], "10.0.0.1/24"),
+        (["10.0.0.1", "/24"], "10.0.0.1/24"),
+        (["10.0.0.1", "255.255.255.0"], "10.0.0.1/24"),
+        (["10.0.0.1/24", "secondary"], "10.0.0.1/24"),
+    ),
+)
+def test_parse_ipv4_interface_accepts_each_address_form(
+    words: list[str], expected: str
+) -> None:
+    """CIDR, slash-length and netmask forms parse to the same interface."""
+    assert parse_ipv4_interface(words) == IPv4Interface(expected)
+
+
+@pytest.mark.parametrize("words", ([], ["dhcp"], ["10.0.0.1", "255.0.255.0"]))
+def test_parse_ipv4_interface_returns_none_for_invalid_words(
+    words: list[str],
+) -> None:
+    """Empty or non-address words yield None instead of raising."""
+    assert parse_ipv4_interface(words) is None
+
+
+def _reload_functions_snapshot() -> tuple[object, str]:
+    """Reload the functions module and capture its converter and fallback output."""
+    reloaded = importlib.reload(functions)
+    return (
+        vars(reloaded)["_convert_to_set_commands_rust"],
+        reloaded.convert_to_set_commands("system {\n    host-name r1;\n}\n"),
+    )
+
+
+def test_functions_module_falls_back_when_native_converter_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Importing without the native converter selects the pure-Python path."""
+    native_converter = vars(functions)["_convert_to_set_commands_rust"]
+    monkeypatch.setitem(sys.modules, "hier_config._hier_config_rust", None)
+    try:
+        fallback_converter, converted = _reload_functions_snapshot()
+    finally:
+        monkeypatch.undo()
+        importlib.reload(functions)
+
+    assert fallback_converter is None
+    assert converted == "set system host-name r1"
+    assert native_converter is not None
+    assert vars(functions)["_convert_to_set_commands_rust"] is native_converter

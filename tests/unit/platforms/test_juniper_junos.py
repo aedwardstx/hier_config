@@ -41,3 +41,16 @@ def test_prefixes() -> None:
 
     assert driver.declaration_prefix == "set "
     assert driver.negation_prefix == "delete "
+
+
+def test_config_preprocessor_converts_hierarchical_text_to_set_commands() -> None:
+    """The stock preprocessor stays callable as a helper for explicit preprocessing."""
+    hierarchical = "system {\n    host-name r1;\n}\n"
+
+    converted = HConfigDriverJuniperJUNOS.config_preprocessor(hierarchical)
+
+    assert converted == "set system host-name r1"
+    assert (
+        HConfig.from_text(Platform.JUNIPER_JUNOS, converted).to_lines()
+        == HConfig.from_text(Platform.JUNIPER_JUNOS, hierarchical).to_lines()
+    )
