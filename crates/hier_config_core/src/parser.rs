@@ -1643,7 +1643,7 @@ mod tests {
 
     #[test]
     fn prefix_guards_only_describe_text_every_match_starts_with() {
-        let cases: [(&str, Option<(bool, usize)>); 20] = [
+        let cases: [(&str, Option<(bool, usize)>); 21] = [
             ("^end$", Some((false, 3))),
             (r"^\s*[#!].*", Some((true, 1))),
             ("^ntp clock-period .*", Some((false, 17))),
@@ -1662,6 +1662,8 @@ mod tests {
             ("^[^!]", None),
             ("^[a-z]", None),
             ("^[]", None),
+            // An unterminated class stops the guard at the literal prefix.
+            ("^ab[cd", Some((false, 2))),
             ("^.x", None),
             // `\s*` could also consume a leading space the guard would demand.
             (r"^\s* x", None),
@@ -2271,10 +2273,10 @@ interface GigabitEthernet0/1
             load(&mut tree, &text);
             // The root plus one node per line.
             assert_eq!(tree.arena.len(), 3);
+            let capacity = tree.arena.capacity();
             assert!(
-                tree.arena.capacity() <= 2 * tree.arena.len(),
-                "two long lines kept {} node slots",
-                tree.arena.capacity()
+                capacity <= 2 * tree.arena.len(),
+                "two long lines kept {capacity} node slots"
             );
         }
     }

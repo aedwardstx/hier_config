@@ -30,6 +30,9 @@ v4 design decisions, for the record:
 
 ### Added
 
+- Behavior-asserting tests for previously unexercised paths across the Python
+  facades and the Rust core (constructors, reporting, platform drivers, views,
+  structured formats, parser, and remediation error propagation). (#302)
 - Acceptance and unit test suites asserting full Unicode (UTF-8, multi-byte, CJK,
   emoji, Cyrillic) support across both native Rust entrypoints and Python facades,
   including text parsing, lines ingestion, structured formats (JSON, XML), views,

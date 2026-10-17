@@ -2250,11 +2250,35 @@ mod tests {
         tree.add_child(tree.root, "hostname Router1", true, false)
             .unwrap();
         let err = tree.add_child(tree.root, "hostname Router1", true, false);
-        assert!(err.is_err());
-        match err.unwrap_err() {
-            TreeError::DuplicateChild(path) => assert_eq!(path, vec!["hostname Router1"]),
-            other => panic!("unexpected error: {other:?}"),
-        }
+        assert_eq!(
+            err,
+            Err(TreeError::DuplicateChild(vec![
+                "hostname Router1".to_owned()
+            ]))
+        );
+    }
+
+    #[test]
+    fn add_parsed_child_rejects_stale_parents_and_empty_text() {
+        let mut tree = Tree::for_platform(Platform::Generic);
+        let stale = tree.add_child(tree.root, "gone", true, false).unwrap();
+        tree.delete_child(stale);
+        assert_eq!(
+            tree.add_parsed_child(stale, 0, |_| Arc::from("x")),
+            Err(TreeError::InvalidParent(stale))
+        );
+        assert_eq!(
+            tree.add_parsed_child(tree.root, 0, |_| Arc::from("")),
+            Err(TreeError::EmptyText)
+        );
+        assert!(tree.arena[tree.root].children.is_empty());
+    }
+
+    #[test]
+    fn depth_at_least_zero_holds_for_every_node() {
+        let tree = Tree::for_platform(Platform::Generic);
+        assert!(tree.depth_at_least(tree.root, 0));
+        assert!(!tree.depth_at_least(tree.root, 1));
     }
 
     #[test]

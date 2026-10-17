@@ -629,11 +629,8 @@ mod tests {
             None,
         )
         .expect_err("no identity child");
-        assert!(
-            error.to_string().contains("Repeated <i>"),
-            "{}",
-            error.to_string()
-        );
+        let message = error.to_string();
+        assert!(message.contains("Repeated <i>"), "{message}");
     }
 
     #[test]
@@ -655,11 +652,9 @@ mod tests {
     fn malformed_documents_are_rejected() {
         let error = from_xml(Driver::for_platform(Platform::CiscoIos), "<a>", None)
             .expect_err("unclosed tag");
-        assert!(
-            error.to_string().starts_with("The config is not valid XML"),
-            "{}",
-            error.to_string()
-        );
+        let message = error.to_string();
+        let prefix = "The config is not valid XML";
+        assert!(message.starts_with(prefix), "{message}");
     }
 
     #[test]

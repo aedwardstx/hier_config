@@ -520,3 +520,24 @@ pub enum TextStyle {
     Merged,
     WithComments,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn platform_all_lists_each_variant_once_with_its_ops() {
+        let mut names = BTreeSet::new();
+        for platform in Platform::ALL {
+            // The compile-time exhaustiveness guard accepts every listed platform.
+            Platform::assert_all_is_exhaustive(platform);
+            assert!(names.insert(platform.as_str()), "{platform:?} listed twice");
+            let rules = platform.ops().rules_json();
+            assert!(
+                rules.contains(&format!("\"platform\": \"{}\"", platform.as_str())),
+                "{platform:?} ops carry another platform's rules"
+            );
+        }
+        assert_eq!(names.len(), Platform::ALL.len());
+    }
+}

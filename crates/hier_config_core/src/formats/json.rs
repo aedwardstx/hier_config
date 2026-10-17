@@ -236,11 +236,8 @@ mod tests {
             None,
         )
         .expect_err("no identity member");
-        assert!(
-            error.to_string().contains("('name', 'id')"),
-            "{}",
-            error.to_string()
-        );
+        let message = error.to_string();
+        assert!(message.contains("('name', 'id')"), "{message}");
     }
 
     #[test]
@@ -251,11 +248,8 @@ mod tests {
             None,
         )
         .expect_err("nested array");
-        assert!(
-            error.to_string().contains("Nested JSON arrays"),
-            "{}",
-            error.to_string()
-        );
+        let message = error.to_string();
+        assert!(message.contains("Nested JSON arrays"), "{message}");
     }
 
     #[test]
@@ -266,11 +260,8 @@ mod tests {
             None,
         )
         .expect_err("whitespace key");
-        assert!(
-            error.to_string().contains("Unsupported JSON key"),
-            "{}",
-            error.to_string()
-        );
+        let message = error.to_string();
+        assert!(message.contains("Unsupported JSON key"), "{message}");
     }
 
     #[test]
