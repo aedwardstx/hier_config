@@ -38,6 +38,8 @@ parsing, formats, views) and `crates/hier_config_py` (Python bindings).
 Python coverage does not measure either crate. The separate Rust-core line
 coverage gate has a **90% floor**, not the Python gate's 95%.
 Do not lower either gate when moving behavior across the boundary.
+[Coverage Gaps](coverage-gaps.md) lists the lines neither gate reaches and
+why, with recommended fixes.
 
 ```bash
 cargo fmt --check
